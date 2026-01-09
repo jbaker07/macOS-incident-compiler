@@ -1,0 +1,9 @@
+playbook_id: signal_consensus_escalation
+description: "Consensus: 2+ corroborated high-value signals in same episode or AgentTamper + any signal"
+severity: high
+slots:
+  - slot_id: consensus_signal
+    kind: signal
+    match:
+      requires_consensus: true
+slots_correlation: []

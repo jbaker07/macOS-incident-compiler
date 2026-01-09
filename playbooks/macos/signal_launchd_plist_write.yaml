@@ -1,0 +1,9 @@
+playbook_id: signal_launchd_plist_write
+description: "Derived signal: LaunchdPlistWriteThenLoad (write to LaunchAgents/Daemons + launchctl)"
+severity: critical
+slots:
+  - slot_id: launchd_plist_signal
+    kind: signal
+    match:
+      signal_type: "LaunchdPlistWriteThenLoad"
+slots_correlation: []

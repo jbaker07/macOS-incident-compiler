@@ -1,0 +1,37 @@
+playbook_id: pb_user_writable_exec_egress
+title: Suspicious Executable Write + Execution + Egress
+severity: high
+entity_scope: host|user|exe
+tags:
+  - mitre.T1059  # Command and Scripting Interpreter
+  - mitre.T1105  # Ingress Tool Transfer
+  - mitre.T1190  # Exploit Public-Facing Application
+  - suspicious_behavior
+description: Detects execution of file written to /tmp or /var/tmp followed by network connection (suspicious dropper pattern)
+
+slots:
+  - slot_id: file_write_tmp
+    required: true
+    ttl_seconds: 60
+    path_regex: ^(/tmp|/var/tmp)/.*
+    event_type:
+      - file_write
+
+  - slot_id: proc_exec_tmp
+    required: true
+    ttl_seconds: 60
+    path_regex: ^(/tmp|/var/tmp)/.*
+    event_type:
+      - proc_exec
+
+  - slot_id: egress_connection
+    required: false
+    ttl_seconds: 30
+    event_type:
+      - net_connect
+
+fire:
+  required_slots:
+    - file_write_tmp
+    - proc_exec_tmp
+  narrative: Suspicious write-exec-egress pattern detected (possible dropper)

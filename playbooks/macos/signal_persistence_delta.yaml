@@ -1,0 +1,9 @@
+playbook_id: signal_persistence_delta
+description: "Derived signal: PersistenceDelta (suspicious file write patterns)"
+severity: medium
+slots:
+  - slot_id: persistence_write_signal
+    kind: signal
+    match:
+      signal_type: "PersistenceDelta"
+slots_correlation: []

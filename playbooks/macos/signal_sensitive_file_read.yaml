@@ -1,0 +1,9 @@
+playbook_id: signal_sensitive_file_read
+description: "Derived signal: SensitiveFileRead (access to SSH keys, keychain, sudoers, etc.)"
+severity: medium
+slots:
+  - slot_id: sensitive_read_signal
+    kind: signal
+    match:
+      signal_type: "SensitiveFileRead"
+slots_correlation: []

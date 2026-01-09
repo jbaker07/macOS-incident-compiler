@@ -1,0 +1,348 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-windows:
+    name: Build Windows Release
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Verify formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy check
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Run tests
+        run: cargo test --workspace --release
+
+      - name: Build release binaries
+        run: cargo build --workspace --release
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Collect artifacts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          
+          # Load canonical allowlist (single source of truth)
+          $allowlistPath = Join-Path $PWD "packaging" "allowlist.json"
+          if (-not (Test-Path $allowlistPath)) {
+            Write-Error "FATAL: packaging/allowlist.json not found!"
+            exit 1
+          }
+          $allowlist = Get-Content $allowlistPath | ConvertFrom-Json
+          
+          $ALLOWED_BINARIES = $allowlist.allowed_binaries
+          $FORBIDDEN_BINARIES = $allowlist.forbidden_binaries
+          
+          # Paths using Join-Path for Windows compatibility
+          $distDir = Join-Path $PWD "dist"
+          $targetRelease = Join-Path $PWD "target" "release"
+          $uiDir = Join-Path $PWD "ui"
+          $docsDir = Join-Path $PWD "docs"
+          
+          Write-Host "=== Build Diagnostics ===" -ForegroundColor Cyan
+          Write-Host "Working directory: $PWD"
+          Write-Host "Target release dir: $targetRelease"
+          Write-Host ""
+          
+          # Verify target/release exists and show contents
+          if (-not (Test-Path $targetRelease)) {
+            Write-Error "FATAL: target/release directory does not exist!"
+            exit 1
+          }
+          
+          Write-Host "=== Contents of target/release ===" -ForegroundColor Cyan
+          Get-ChildItem $targetRelease -Filter "*.exe" | ForEach-Object { Write-Host "  Found: $($_.Name)" }
+          Write-Host ""
+          
+          # Create dist directory
+          Write-Host "Creating dist directory..."
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+          
+          # Copy allowed binaries only
+          Write-Host "=== Copying Allowed Binaries ===" -ForegroundColor Cyan
+          foreach ($bin in $ALLOWED_BINARIES) {
+            $srcPath = Join-Path $targetRelease $bin
+            if (Test-Path $srcPath) {
+              Copy-Item $srcPath $distDir -Force
+              Write-Host "  ✓ Copied: $bin" -ForegroundColor Green
+            } else {
+              Write-Error "FATAL: Required binary not found: $srcPath"
+              exit 1
+            }
+          }
+          
+          # Security check: Ensure forbidden binaries are NOT copied
+          Write-Host ""
+          Write-Host "=== Security Check: Forbidden Binaries ===" -ForegroundColor Yellow
+          foreach ($forbidden in $FORBIDDEN_BINARIES) {
+            $forbiddenPath = Join-Path $distDir $forbidden
+            if (Test-Path $forbiddenPath) {
+              Write-Error "SECURITY VIOLATION: Forbidden binary found in dist: $forbidden"
+              exit 1
+            }
+            $srcForbidden = Join-Path $targetRelease $forbidden
+            if (Test-Path $srcForbidden) {
+              Write-Host "  ⚠ Built but NOT shipped: $forbidden" -ForegroundColor Yellow
+            }
+          }
+          Write-Host "  ✓ Security check passed" -ForegroundColor Green
+          Write-Host ""
+          
+          # Copy UI assets
+          Write-Host "=== Copying UI Assets ===" -ForegroundColor Cyan
+          if (-not (Test-Path $uiDir)) {
+            Write-Error "FATAL: ui directory does not exist!"
+            exit 1
+          }
+          $uiDest = Join-Path $distDir "ui"
+          Copy-Item -Path $uiDir -Destination $uiDest -Recurse -Force
+          Write-Host "  ✓ Copied ui/ directory" -ForegroundColor Green
+          Write-Host ""
+          
+          # Copy docs
+          Write-Host "=== Copying Documentation ===" -ForegroundColor Cyan
+          $licensingDoc = Join-Path $docsDir "LICENSING.md"
+          $readme = Join-Path $PWD "README.md"
+          
+          if (Test-Path $licensingDoc) {
+            Copy-Item $licensingDoc $distDir -Force
+            Write-Host "  ✓ Copied: LICENSING.md" -ForegroundColor Green
+          } else {
+            Write-Warning "Optional doc not found: docs/LICENSING.md"
+          }
+          
+          if (Test-Path $readme) {
+            Copy-Item $readme $distDir -Force
+            Write-Host "  ✓ Copied: README.md" -ForegroundColor Green
+          } else {
+            Write-Warning "Optional doc not found: README.md"
+          }
+          Write-Host ""
+          
+          # Generate deterministic MANIFEST.txt (sorted file list + sizes + sha256)
+          Write-Host "=== Generating MANIFEST.txt ===" -ForegroundColor Cyan
+          $manifestPath = Join-Path $distDir "MANIFEST.txt"
+          $manifestLines = @()
+          $manifestLines += "# EDR Release Manifest v1.0"
+          $manifestLines += "# Format: <sha256>  <size>  <path>"
+          $manifestLines += "# Generated by release workflow"
+          $manifestLines += ""
+          
+          Get-ChildItem $distDir -Recurse -File | Sort-Object { $_.FullName.Replace("$distDir\", "").Replace("\", "/") } | ForEach-Object {
+            $relativePath = $_.FullName.Replace("$distDir\", "").Replace("\", "/")
+            # Skip manifest itself
+            if ($_.Name -ne "MANIFEST.txt") {
+              $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+              $size = $_.Length
+              $manifestLines += "$hash  $size  $relativePath"
+            }
+          }
+          $manifestLines -join "`n" | Out-File -FilePath $manifestPath -Encoding utf8 -NoNewline
+          Write-Host "  ✓ Generated MANIFEST.txt ($(($manifestLines | Where-Object { $_ -match '^\w{64}' }).Count) files)" -ForegroundColor Green
+          Write-Host ""
+          
+          # Generate SHA256 checksums (compatible format for sha256sum -c)
+          Write-Host "=== Generating SHA256SUMS.txt ===" -ForegroundColor Cyan
+          $checksumPath = Join-Path $distDir "SHA256SUMS.txt"
+          $checksumLines = @()
+          Get-ChildItem (Join-Path $distDir "*.exe") | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            $checksumLines += "$hash  $($_.Name)"
+          }
+          $checksumLines -join "`n" | Out-File -FilePath $checksumPath -Encoding utf8 -NoNewline
+          Write-Host ""
+          Write-Host "=== SHA256 Checksums ===" -ForegroundColor Cyan
+          Get-Content $checksumPath
+          Write-Host ""
+          
+          # Final verification
+          Write-Host "=== Final Distribution Contents ===" -ForegroundColor Cyan
+          Get-ChildItem $distDir -Recurse | ForEach-Object {
+            $indent = "  " * ($_.FullName.Split('\').Count - $distDir.Split('\').Count)
+            Write-Host "$indent$($_.Name)"
+          }
+          Write-Host ""
+          Write-Host "✓ Artifact collection complete!" -ForegroundColor Green
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: edr-windows-${{ github.ref_name }}
+          path: dist/
+          retention-days: 90
+
+  create-release:
+    name: Create GitHub Release
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: edr-windows-${{ github.ref_name }}
+          path: dist/
+
+      - name: Validate artifact contents
+        run: |
+          echo "=== Artifact Validation ==="
+          
+          # Define allowlist
+          ALLOWED_BINARIES="edr-server.exe edr-locald.exe capture_windows_rotating.exe"
+          FORBIDDEN_BINARIES="license_gen.exe golden-cli.exe proof_run.exe metrics_run.exe explain_harness.exe wevt_smoke.exe agent-windows.exe"
+          
+          echo "Contents of dist/:"
+          ls -la dist/
+          echo ""
+          
+          # Check required binaries exist
+          echo "Checking required binaries..."
+          for bin in $ALLOWED_BINARIES; do
+            if [ -f "dist/$bin" ]; then
+              echo "  ✓ Found: $bin"
+            else
+              echo "  ✗ MISSING: $bin"
+              exit 1
+            fi
+          done
+          
+          # Security check: ensure forbidden binaries are NOT present
+          echo ""
+          echo "Security check: forbidden binaries..."
+          for forbidden in $FORBIDDEN_BINARIES; do
+            if [ -f "dist/$forbidden" ]; then
+              echo "  ✗ SECURITY VIOLATION: Found forbidden binary: $forbidden"
+              exit 1
+            fi
+          done
+          echo "  ✓ No forbidden binaries found"
+          
+          # Check ui folder exists
+          echo ""
+          echo "Checking UI assets..."
+          if [ -d "dist/ui" ]; then
+            echo "  ✓ ui/ directory exists"
+            ls -la dist/ui/
+          else
+            echo "  ✗ ui/ directory missing"
+            exit 1
+          fi
+          
+          # Display manifest if present
+          echo ""
+          if [ -f "dist/MANIFEST.txt" ]; then
+            echo "=== MANIFEST.txt ==="
+            cat dist/MANIFEST.txt
+          fi
+          
+          echo ""
+          echo "✓ Artifact validation passed!"
+
+      - name: Create release archive
+        run: |
+          cd dist
+          zip -r ../edr-windows-${{ github.ref_name }}.zip .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            edr-windows-${{ github.ref_name }}.zip
+            dist/SHA256SUMS.txt
+          body: |
+            ## EDR Release ${{ github.ref_name }}
+
+            ### Included Components
+            - `edr-server.exe` - Main server with web UI
+            - `edr-locald.exe` - Local detection daemon
+            - `capture_windows_rotating.exe` - Windows event capture agent
+            - `ui/` - Web interface assets
+
+            ### Installation
+            1. Extract the archive to your desired location
+            2. Run `edr-server.exe` to start the server
+            3. Access the web UI at http://localhost:3000
+
+            ### Pro Features
+            Pro features (e.g., Diff Mode) require a valid license.
+            See `LICENSING.md` for activation instructions.
+
+            ### Checksums
+            See `SHA256SUMS.txt` for file integrity verification.
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Optional: Internal build with pro feature for testing
+  build-internal:
+    name: Build Internal (Pro Feature)
+    runs-on: windows-latest
+    if: github.repository == 'jbaker07/windows-incident-compiler'
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pro-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build with pro feature
+        run: cargo build --release --features pro
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Run pro tests
+        run: cargo test --workspace --release --features pro
+
+      - name: Upload internal build
+        uses: actions/upload-artifact@v4
+        with:
+          name: edr-windows-internal-${{ github.ref_name }}
+          path: |
+            target/release/edr-server.exe
+            target/release/edr-locald.exe
+          retention-days: 30

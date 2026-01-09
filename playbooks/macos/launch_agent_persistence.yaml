@@ -1,0 +1,40 @@
+---
+id: pb_launch_agent_persistence
+name: "Launch Agent/Daemon persistence setup"
+description: |
+  File write to LaunchAgents or LaunchDaemons directory + launchctl load/bootstrap.
+  Classic macOS persistence mechanism.
+  
+  MITRE: T1543.001 (Create or Modify System Process - Launch Agent),
+         T1547.011 (Boot or Logon Initialization Scripts - Launchd)
+  Severity: CRITICAL (9/10) - Almost certain persistence attempt
+  
+severity: CRITICAL
+confidence: 0.95
+ttl_sec: 600  # 10 minutes
+cooldown_sec: 120
+
+required_slots:
+  - id: file_write_launch
+    fact_type: FileWrite
+    constraint: "path matches /^(.*LaunchAgents|.*LaunchDaemons).*\\.plist$/"
+    
+  - id: launchctl_exec
+    fact_type: ProcExec
+    constraint: "exe contains 'launchctl' and (argv contains 'load' or argv contains 'bootstrap') 
+                 and ts within 600s of file_write_launch"
+
+optional_slots:
+  - id: source_write
+    fact_type: FileWrite
+    constraint: "before file_write_launch, from same uid, not plist (e.g., script or binary)"
+
+tags:
+  - macOS
+  - persistence
+  - launchd
+  - critical
+
+narrative_template: |
+  Persistence setup detected: {file_write_launch.path} created, followed by launchctl {launchctl_exec.argv[1]}.
+  Executed as uid={file_write_launch.uid}. Evidence: {slots[file_write_launch].ptr}, {slots[launchctl_exec].ptr}

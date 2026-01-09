@@ -1,0 +1,9 @@
+playbook_id: signal_log_wipe
+description: "LogWipeAttempt: deletion/renaming of log files in /var/log"
+severity: high
+slots:
+  - slot_id: log_wipe_signal
+    kind: signal
+    match:
+      signal_type: "LogWipeAttempt"
+slots_correlation: []

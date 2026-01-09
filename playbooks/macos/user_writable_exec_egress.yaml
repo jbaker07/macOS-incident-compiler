@@ -1,0 +1,39 @@
+---
+id: pb_user_writable_exec_egress
+name: "Suspicious execution from user-writable directory + egress"
+description: |
+  Process exec from user-writable path (e.g., /tmp, ~/Downloads, ~/Desktop)
+  followed by network connection within TTL. Indicates dropper or LoTL execution.
+  
+  MITRE: T1204 (User Execution), T1071 (Application Layer Protocol)
+  Severity: HIGH (8/10) - High confidence of malicious activity if combined
+  
+severity: HIGH
+confidence: 0.7
+ttl_sec: 300  # 5 minutes
+cooldown_sec: 60
+
+required_slots:
+  - id: proc_exec_writable
+    fact_type: ProcExec
+    constraint: "exe matches /^(\/tmp|\/var\/tmp|\/dev\/shm|\/Users\/[^/]+\/(Downloads|Desktop|Documents))/"
+    
+  - id: net_connect
+    fact_type: NetConnect
+    constraint: "entity matches proc_exec_writable.entity and ts within 300s"
+
+optional_slots:
+  - id: file_write_temp
+    fact_type: FileWrite
+    constraint: "path matches /tmp or /var/tmp, before proc_exec_writable"
+
+tags:
+  - macOS
+  - dropper
+  - suspicious-exec
+  - network-activity
+
+narrative_template: |
+  Process {proc_exec_writable.exe} executed from suspicious location ({proc_exec_writable.path}) 
+  with args {proc_exec_writable.argv}. Followed by outbound connection to {net_connect.dst_ip}:{net_connect.dst_port}.
+  Evidence: {slots[proc_exec_writable].ptr}, {slots[net_connect].ptr}

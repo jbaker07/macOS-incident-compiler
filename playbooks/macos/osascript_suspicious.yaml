@@ -1,0 +1,39 @@
+---
+id: pb_osascript_suspicious_args
+name: "osascript/AppleScript with suspicious arguments"
+description: |
+  osascript or osascript_helper execution with suspicious patterns.
+  Often indicates LoTL (Living off the Land) usage for data exfiltration or lateral movement.
+  
+  MITRE: T1059.002 (Command and Scripting Interpreter - AppleScript/OSA),
+         T1086 (PowerShell for macOS via osascript bridges)
+  Severity: HIGH (7/10) - Depends on args; malware often uses osascript for C2 or shell escape
+  
+severity: HIGH
+confidence: 0.65
+ttl_sec: 120
+cooldown_sec: 60
+
+required_slots:
+  - id: osascript_exec
+    fact_type: ProcExec
+    constraint: "exe contains 'osascript' and (argv contains 'curl' or argv contains 'wget' or argv contains 'sh' or argv contains 'bash' or argv contains 'python')"
+
+optional_slots:
+  - id: network_after
+    fact_type: NetConnect
+    constraint: "ts within 120s of osascript_exec"
+    
+  - id: temp_file_write
+    fact_type: FileWrite
+    constraint: "path matches /tmp and ts within 120s of osascript_exec"
+
+tags:
+  - macOS
+  - LoTL
+  - script-execution
+  - suspicious-args
+
+narrative_template: |
+  Suspicious osascript execution: {osascript_exec.argv}
+  Executed as uid={osascript_exec.uid}. Evidence: {slots[osascript_exec].ptr}

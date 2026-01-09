@@ -1,0 +1,9 @@
+playbook_id: signal_browser_cred_access
+description: "BrowserCredentialStoreAccess: access to Chrome/Firefox credential stores"
+severity: high
+slots:
+  - slot_id: browser_cred_signal
+    kind: signal
+    match:
+      signal_type: "BrowserCredentialStoreAccess"
+slots_correlation: []

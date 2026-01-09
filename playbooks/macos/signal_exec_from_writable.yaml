@@ -1,0 +1,9 @@
+playbook_id: signal_exec_from_writable
+description: "Derived signal: ExecFromUserWritable (executable from /tmp, /var/tmp, writable paths)"
+severity: high
+slots:
+  - slot_id: writable_exec_signal
+    kind: signal
+    match:
+      signal_type: "ExecFromUserWritable"
+slots_correlation: []

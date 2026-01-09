@@ -1,0 +1,23 @@
+playbook_id: pb_osascript_suspicious
+title: AppleScript Execution (Possible Living-off-the-Land)
+severity: medium
+entity_scope: host|user|exe
+tags:
+  - mitre.T1059.002  # AppleScript and JavaScript for Automation
+  - mitre.T1218  # System Binary Proxy Execution
+  - living_off_the_land
+  - lotl
+description: Detects osascript execution with suspicious arguments (can be used for credential theft or reverse shells)
+
+slots:
+  - slot_id: osascript_exec
+    required: true
+    ttl_seconds: 60
+    exe: /usr/bin/osascript
+    event_type:
+      - proc_exec
+
+fire:
+  required_slots:
+    - osascript_exec
+  narrative: AppleScript execution detected - potential LoTL attack vector

@@ -1,0 +1,9 @@
+playbook_id: signal_interpreter_writable
+description: "Derived signal: InterpreterExecFromWritable (python/node/bash script from writable path)"
+severity: high
+slots:
+  - slot_id: interpreter_writable_signal
+    kind: signal
+    match:
+      signal_type: "InterpreterExecFromWritable"
+slots_correlation: []

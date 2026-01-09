@@ -1,0 +1,9 @@
+playbook_id: signal_dyld_injection
+description: "Derived signal: DYLDInjectionAttempt (high mmap activity suggesting DYLD hijacking)"
+severity: high
+slots:
+  - slot_id: dyld_injection_signal
+    kind: signal
+    match:
+      signal_type: "DYLDInjectionAttempt"
+slots_correlation: []

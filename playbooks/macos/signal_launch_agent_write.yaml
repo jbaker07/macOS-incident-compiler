@@ -1,0 +1,9 @@
+playbook_id: signal_launch_agent_write
+description: "LaunchAgentWrite: unauthorized write to LaunchAgents/Daemons"
+severity: high
+slots:
+  - slot_id: launchagent_write_signal
+    kind: signal
+    match:
+      signal_type: "LaunchAgentWrite"
+slots_correlation: []

@@ -1,0 +1,9 @@
+playbook_id: signal_lolbin_abuse
+description: "LOLBinAbuse: execution of osascript, curl, python, bash, sh, etc."
+severity: medium
+slots:
+  - slot_id: lolbin_signal
+    kind: signal
+    match:
+      signal_type: "LOLBinAbuse"
+slots_correlation: []

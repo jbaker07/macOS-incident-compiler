@@ -1,0 +1,9 @@
+playbook_id: signal_high_conn_rate_burst
+description: "Derived signal: HighConnRateBurst (10+ connections/min)"
+severity: high
+slots:
+  - slot_id: high_conn_burst
+    kind: signal
+    match:
+      signal_type: "HighConnRateBurst"
+slots_correlation: []

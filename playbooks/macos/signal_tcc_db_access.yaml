@@ -1,0 +1,9 @@
+playbook_id: signal_tcc_db_access
+description: "TCCDBAccessAttempt: access to TCC.db (privacy controls)"
+severity: high
+slots:
+  - slot_id: tcc_access_signal
+    kind: signal
+    match:
+      signal_type: "TCCDBAccessAttempt"
+slots_correlation: []

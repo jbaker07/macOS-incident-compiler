@@ -1,0 +1,39 @@
+---
+id: pb_sudo_anomaly
+name: "Anomalous sudo usage patterns"
+description: |
+  Unexpected sudo executions or repeated auth failures.
+  Indicates privilege escalation attempts or lateral movement.
+  
+  MITRE: T1548.003 (Abuse Elevation Control Mechanism - sudo),
+         T1098.004 (Account Manipulation - SSH Key Pair)
+  Severity: MEDIUM-HIGH (6/10)
+  
+severity: MEDIUM
+confidence: 0.6
+ttl_sec: 300
+cooldown_sec: 120
+
+required_slots:
+  - id: sudo_exec
+    fact_type: ProcExec
+    constraint: "exe contains 'sudo' and (argv contains '-u' or argv contains '-i' or argv contains '-s')"
+
+optional_slots:
+  - id: auth_failure
+    fact_type: AuthEvent
+    constraint: "result == 'FAILURE' and ts within 60s before sudo_exec"
+    
+  - id: ssh_related
+    fact_type: ProcExec
+    constraint: "exe contains 'ssh' and ts within 300s of sudo_exec"
+
+tags:
+  - macOS
+  - privilege-escalation
+  - sudo
+  - auth-anomaly
+
+narrative_template: |
+  Anomalous sudo usage: {sudo_exec.argv} by {sudo_exec.user}.
+  Evidence: {slots[sudo_exec].ptr}

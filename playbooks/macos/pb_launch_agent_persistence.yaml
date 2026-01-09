@@ -1,0 +1,31 @@
+playbook_id: pb_launch_agent_persistence
+title: LaunchAgent Persistence Detected
+severity: high
+entity_scope: host|user
+tags:
+  - mitre.T1547.014  # Boot or Logon Initialization Scripts (LaunchAgent)
+  - mitre.T1547.011  # Login Hook
+  - persistence
+  - lateral_movement
+description: Detects creation of LaunchAgent plist files followed by launchctl operations
+
+slots:
+  - slot_id: plist_write
+    required: true
+    ttl_seconds: 120
+    path_regex: .*\.plist$
+    event_type:
+      - file_write
+
+  - slot_id: launchctl_load
+    required: true
+    ttl_seconds: 120
+    exe: /bin/launchctl
+    event_type:
+      - proc_exec
+
+fire:
+  required_slots:
+    - plist_write
+    - launchctl_load
+  narrative: LaunchAgent persistence attempt detected (plist + launchctl load)

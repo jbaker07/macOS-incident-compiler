@@ -1,0 +1,9 @@
+playbook_id: signal_new_remote_ip
+description: "Derived signal: NewRemoteIPForExe (first-seen IP per exe/user/host)"
+severity: medium
+slots:
+  - slot_id: new_ip_signal
+    kind: signal
+    match:
+      signal_type: "NewRemoteIPForExe"
+slots_correlation: []

@@ -1,0 +1,9 @@
+playbook_id: signal_agent_tamper
+description: "AgentTamperAttempt: attempt to kill/delete/modify EDR daemon/config"
+severity: critical
+slots:
+  - slot_id: tamper_signal
+    kind: signal
+    match:
+      signal_type: "AgentTamperAttempt"
+slots_correlation: []

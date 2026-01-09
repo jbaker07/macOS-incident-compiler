@@ -1,0 +1,9 @@
+playbook_id: signal_suspicious_keychain
+description: "Derived signal: SuspiciousKeychainAccess (keychain tool usage)"
+severity: medium
+slots:
+  - slot_id: keychain_access_signal
+    kind: signal
+    match:
+      signal_type: "SuspiciousKeychainAccess"
+slots_correlation: []
