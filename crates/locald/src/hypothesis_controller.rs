@@ -20,6 +20,7 @@ use crate::slot_matcher::{
     CapabilityRegistry, FillStrength, HypothesisKey, PlaybookDef, PlaybookIndex, SlotMatcher,
 };
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
@@ -51,9 +52,65 @@ pub struct HypothesisController {
     bucket_seconds: i64,
     /// Cooldown tracker: (playbook_id, entity_key) → last_fire_ts
     cooldowns: HashMap<String, DateTime<Utc>>,
+    /// Newest fact time seen, used to prune snapshots
+    latest_fact_ts: Option<DateTime<Utc>>,
+}
+
+/// The part of the controller's state that has to survive a restart: every
+/// hypothesis that can still take facts or block a duplicate, and the
+/// cooldown clock of each playbook and entity. Incidents that already fired
+/// are in the database, so they are not part of this.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ControllerSnapshot {
+    pub hypotheses: Vec<HypothesisState>,
+    pub cooldowns: Vec<(String, DateTime<Utc>)>,
+    pub latest_fact_ts: Option<DateTime<Utc>>,
 }
 
 impl HypothesisController {
+    /// Snapshot of the open state. Hypotheses whose window ended before the
+    /// newest fact seen are left out, since no later fact can fill them.
+    /// Cooldowns older than a day of event time are left out too.
+    pub fn snapshot(&self) -> ControllerSnapshot {
+        let latest = self.latest_fact_ts;
+        let mut hypotheses: Vec<HypothesisState> = self
+            .hypotheses
+            .values()
+            .filter(|h| latest.map(|t| h.expires_at >= t).unwrap_or(true))
+            .cloned()
+            .collect();
+        hypotheses.sort_by(|a, b| a.hypothesis_id.cmp(&b.hypothesis_id));
+        let mut cooldowns: Vec<(String, DateTime<Utc>)> = self
+            .cooldowns
+            .iter()
+            .filter(|(_, fired)| latest.map(|t| **fired + chrono::Duration::days(1) >= t).unwrap_or(true))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        cooldowns.sort();
+        ControllerSnapshot {
+            hypotheses,
+            cooldowns,
+            latest_fact_ts: latest,
+        }
+    }
+
+    /// Put back a snapshot taken with `snapshot`. Playbooks must be
+    /// registered first. Returns how many hypotheses were restored.
+    pub fn restore(&mut self, snapshot: ControllerSnapshot) -> usize {
+        let count = snapshot.hypotheses.len();
+        for hypothesis in snapshot.hypotheses {
+            self.hypotheses.insert(hypothesis.hypothesis_id.clone(), hypothesis);
+        }
+        for (key, fired) in snapshot.cooldowns {
+            self.cooldowns.insert(key, fired);
+        }
+        self.latest_fact_ts = match (self.latest_fact_ts, snapshot.latest_fact_ts) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        count
+    }
+
     /// Create a new HypothesisController
     pub fn new(host_id: impl Into<String>) -> Self {
         Self {
@@ -70,6 +127,7 @@ impl HypothesisController {
             slot_matcher: SlotMatcher::new(),
             bucket_seconds: 600, // 10-minute buckets
             cooldowns: HashMap::new(),
+            latest_fact_ts: None,
         }
     }
 
@@ -89,6 +147,7 @@ impl HypothesisController {
             slot_matcher: SlotMatcher::new(),
             bucket_seconds: 600,
             cooldowns: HashMap::new(),
+            latest_fact_ts: None,
         }
     }
 
@@ -113,6 +172,7 @@ impl HypothesisController {
             slot_matcher: SlotMatcher::new(),
             bucket_seconds: 600,
             cooldowns: HashMap::new(),
+            latest_fact_ts: None,
         })
     }
 
@@ -231,7 +291,10 @@ impl HypothesisController {
         let fact_type = Self::fact_type_discriminant(fact);
         let mut affected_ids = Vec::new();
         let mut incidents_to_fire = Vec::new();
-        let now = Utc::now();
+        // Windows, TTLs and cooldowns run on event time, not wall clock time,
+        // so replaying an old audit trail behaves the same as live capture.
+        let now = fact.ts;
+        self.latest_fact_ts = Some(self.latest_fact_ts.map_or(now, |t| t.max(now)));
 
         // Get candidate playbooks for this fact type (O(1) lookup)
         let candidates = self.playbook_index.candidates_for_fact_type(fact_type);
@@ -304,7 +367,7 @@ impl HypothesisController {
             if hypothesis.status != HypothesisStatus::Hypothesis {
                 continue;
             }
-            if hypothesis.is_expired() {
+            if fact.ts > hypothesis.expires_at {
                 hypothesis.expire();
                 continue;
             }
@@ -357,10 +420,7 @@ impl HypothesisController {
                 Ok(incident_id) => {
                     // Record cooldown
                     self.cooldowns.insert(cooldown_key, now);
-                    eprintln!(
-                        "[hypothesis] Playbook fired: hypothesis {} → incident {}",
-                        hypothesis_id, incident_id
-                    );
+                    let _ = incident_id;
                 }
                 Err(e) => {
                     eprintln!("[hypothesis] Failed to promote {}: {}", hypothesis_id, e);
@@ -436,9 +496,10 @@ impl HypothesisController {
             match component.trim() {
                 "host" => parts.push(fact.host_id.clone()),
                 "user" => {
-                    // Extract user from scope_key if available
-                    if let ScopeKey::User { key } = &fact.scope_key {
-                        parts.push(key.clone());
+                    // User or login session from the scope key
+                    match &fact.scope_key {
+                        ScopeKey::User { key } | ScopeKey::Session { key } => parts.push(key.clone()),
+                        _ => {}
                     }
                 }
                 "exe" => {

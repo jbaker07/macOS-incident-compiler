@@ -713,6 +713,7 @@ impl IngestSource for SyslogUdpSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::config::JoinStrategy;
     use std::io::Write;
     use tempfile::NamedTempFile;
 

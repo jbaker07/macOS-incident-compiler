@@ -1,0 +1,17 @@
+playbook_id: macos_task_port_access
+title: Task port of another process taken by a non system program
+family: defense_evasion
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, process_injection, T1055]
+narrative: task_for_pid succeeded for a program outside the system folders and developer tools. A task port gives full control of the target's memory and threads, which is how injection is done on macOS.
+slots:
+  - slot_id: task_port
+    name: Successful task_for_pid or ptrace
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Injection
+      actor_exe_not_regex: '^/(System|usr/libexec|usr/sbin|Library/Developer)/|^/usr/bin/lldb$|^/Applications/Xcode[^/]*\.app/'

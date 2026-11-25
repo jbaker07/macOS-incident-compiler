@@ -1,5 +1,3 @@
-//! OS-specific signal detection engines
+//! OS specific detection code. Only macOS is supported.
 
-pub mod linux;
 pub mod macos;
-pub mod windows;

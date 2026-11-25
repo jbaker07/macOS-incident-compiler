@@ -1,0 +1,24 @@
+playbook_id: macos_sudo_root_shell
+title: sudo used to open a root shell
+family: privilege_escalation
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [privilege_escalation, sudo, T1548.003]
+narrative: sudo was asked for an interactive root shell and the process then changed its user id to root.
+slots:
+  - slot_id: sudo_shell
+    name: sudo -s, sudo -i, sudo su or sudo with a shell
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/bin/sudo$'
+      cmdline_regex: '^sudo(\s+-\S+)*\s+(-s|-i|su|/bin/(ba|z)?sh)(\s|$)|^sudo\s+-[A-Za-z]*[si][A-Za-z]*$'
+  - slot_id: became_root
+    name: setuid to uid 0
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: PrivilegeBoundary

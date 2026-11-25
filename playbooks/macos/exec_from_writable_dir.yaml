@@ -1,0 +1,17 @@
+playbook_id: macos_exec_from_writable_dir
+title: Program run from a world writable folder
+family: execution
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [execution, T1204.002]
+narrative: A binary was executed from /tmp, /var/tmp, /Users/Shared or a per user temp folder. Installers do this sometimes, downloaded payloads do it often.
+slots:
+  - slot_id: writable_exec
+    name: Exec of a binary under /tmp, /var/tmp, /private/var/folders or /Users/Shared
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/(private/)?(tmp|var/tmp)/|^/private/var/folders/|^/Users/Shared/'

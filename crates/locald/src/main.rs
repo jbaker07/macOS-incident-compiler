@@ -1,411 +1,550 @@
-//! EDR Locald entry point - macOS signal detection daemon
+//! edr-locald: macOS detection daemon.
 //!
-//! Pipeline: segments/*.jsonl -> MacOSSignalEngine -> signals table -> edr-server
+//! segments/*.jsonl (from capture_macos_rotating)
+//!   -> facts (os::macos::fact_extractor)
+//!   -> playbook slots (HypothesisController with the YAML playbooks)
+//!   -> incidents, stored as rows in workbench.db for edr-server
 //!
-//! This daemon continuously watches telemetry segments produced by
-//! capture_macos_rotating and runs detection logic via MacOSSignalEngine.
-//! It also runs the hypothesis/incident compiler for explainability.
+//! Each playbook that fires is stored as one row in the `signals` table
+//! (signal_id is the hypothesis id), and a full explanation is stored in
+//! `signal_explanations`. The hypothesis controller also groups detections
+//! of the same family and login session into one incident. That incident id
+//! is kept in the signal metadata so related detections can be listed
+//! together. The explanation lists every slot of the
+//! playbook, the evidence pointer that filled it, and the event line read
+//! back from the segment file with its SHA-256 checked, so an analyst can
+//! see exactly which audit records produced the incident.
+//!
+//! After every segment, the list of finished segments and the controller's
+//! open hypotheses are saved in one SQLite transaction. On start both are
+//! read back, so a restart in the middle of a multi step playbook loses
+//! nothing. If edr-locald dies in the middle of a segment, that segment is
+//! processed again from the last saved state. Signal ids are deterministic
+//! and rows are written with INSERT OR REPLACE, so that is safe.
 
-use chrono::Utc;
-use edr_core::{Event, EvidencePtr};
-use edr_locald::hypothesis_controller::HypothesisController;
-use edr_locald::os::macos::{extract_facts, macos_playbooks};
-use edr_locald::scoring::ScoringEngine;
-use edr_locald::MacOSSignalEngine;
+use chrono::{DateTime, Utc};
+use edr_core::Event;
+use edr_locald::hypothesis::canonical_event::EvidencePtr;
+use edr_locald::hypothesis_controller::{ControllerSnapshot, HypothesisController};
+use edr_locald::os::macos::{extract_facts_with_hash, load_playbooks_from_dir, macos_playbooks};
+use edr_locald::slot_matcher::PlaybookDef;
 use rusqlite::{params, Connection};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashSet};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Get telemetry root from env or default
-fn get_telemetry_root() -> PathBuf {
-    std::env::var("EDR_TELEMETRY_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/edr"))
-}
+const USAGE: &str = "\
+edr-locald: run the macOS playbooks over capture segments
 
-/// Index file structure
+USAGE:
+  edr-locald [--telemetry-root DIR] [--playbooks DIR] [--once]
+
+OPTIONS:
+  --telemetry-root DIR  folder with index.json and segments/ (default: $EDR_TELEMETRY_ROOT, else ./telemetry_output)
+  --playbooks DIR       load YAML playbooks from DIR (default: $EDR_PLAYBOOK_DIR, else the built in set)
+  --once                process the segments that exist now, then exit
+  -h, --help            show this help
+";
+
 #[derive(Debug, Deserialize)]
 struct SegmentIndex {
-    #[allow(dead_code)]
-    schema_version: u32,
     segments: Vec<SegmentEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct SegmentEntry {
-    #[serde(alias = "path", alias = "rel_path")]
-    path: Option<String>,
-    #[allow(dead_code)]
-    stream_id: Option<String>,
+    seq: u64,
+    rel_path: String,
+    #[serde(default)]
+    sha256_segment: Option<String>,
 }
 
-impl SegmentEntry {
-    fn get_path(&self) -> Option<&str> {
-        self.path.as_deref()
+struct Args {
+    telemetry_root: PathBuf,
+    playbook_dir: Option<PathBuf>,
+    once: bool,
+}
+
+fn parse_args() -> Result<Option<Args>, String> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut telemetry_root = std::env::var("EDR_TELEMETRY_ROOT").ok().map(PathBuf::from);
+    let mut playbook_dir = std::env::var("EDR_PLAYBOOK_DIR").ok().map(PathBuf::from);
+    let mut once = false;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--telemetry-root" | "--playbooks" => {
+                let value = raw.get(i + 1).ok_or_else(|| format!("{} needs a value", raw[i]))?;
+                if raw[i] == "--telemetry-root" {
+                    telemetry_root = Some(PathBuf::from(value));
+                } else {
+                    playbook_dir = Some(PathBuf::from(value));
+                }
+                i += 1;
+            }
+            "--once" => once = true,
+            "-h" | "--help" => return Ok(None),
+            other => return Err(format!("unknown argument '{}'", other)),
+        }
+        i += 1;
+    }
+    Ok(Some(Args {
+        telemetry_root: telemetry_root.unwrap_or_else(|| PathBuf::from("telemetry_output")),
+        playbook_dir,
+        once,
+    }))
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+fn open_db(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS signals (
+            signal_id TEXT PRIMARY KEY,
+            signal_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            host TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            ts_start INTEGER NOT NULL,
+            ts_end INTEGER NOT NULL,
+            proc_key TEXT,
+            file_key TEXT,
+            identity_key TEXT,
+            metadata TEXT NOT NULL,
+            evidence_ptrs TEXT NOT NULL,
+            dropped_evidence_count INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts DESC);
+        CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(signal_type);
+        CREATE TABLE IF NOT EXISTS signal_explanations (
+            signal_id TEXT PRIMARY KEY,
+            explanation_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS locald_checkpoint (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );",
+    )?;
+    Ok(conn)
+}
+
+/// Reads segment lines back by (segment seq, line number) for explanations.
+struct EvidenceReader {
+    root: PathBuf,
+    paths: HashMap<u64, String>,
+    cache: HashMap<u64, Vec<String>>,
+}
+
+impl EvidenceReader {
+    fn line(&mut self, seq: u64, index: u64) -> Option<String> {
+        if !self.cache.contains_key(&seq) {
+            let rel = self.paths.get(&seq)?;
+            let text = fs::read_to_string(self.root.join(rel)).ok()?;
+            let lines: Vec<String> = text.lines().map(|l| l.to_string()).collect();
+            // Keep the cache small. Explanations usually point at recent segments.
+            if self.cache.len() > 16 {
+                self.cache.clear();
+            }
+            self.cache.insert(seq, lines);
+        }
+        self.cache.get(&seq)?.get(index as usize).cloned()
+    }
+
+    /// The evidence entry for one pointer: the pointer, the event line read
+    /// back from disk, and whether its hash still matches.
+    fn excerpt(&mut self, ptr: &EvidencePtr) -> Value {
+        let seq = ptr.segment_id.parse::<u64>().ok();
+        let line = seq.and_then(|s| self.line(s, ptr.record_index));
+        let (event, verified) = match &line {
+            Some(text) => {
+                let ok = ptr
+                    .record_sha256
+                    .as_ref()
+                    .map(|h| *h == sha256_hex(text.as_bytes()))
+                    .unwrap_or(false);
+                (serde_json::from_str::<Value>(text).unwrap_or(Value::Null), ok)
+            }
+            None => (Value::Null, false),
+        };
+        json!({
+            "stream_id": ptr.stream_id,
+            "segment_seq": seq,
+            "record_index": ptr.record_index,
+            "record_sha256": ptr.record_sha256,
+            "ts": ptr.ts,
+            "verified": verified,
+            "event": event,
+        })
     }
 }
 
-/// Parse a segment JSONL record into edr_core::Event
-fn parse_segment_record(line: &str, segment_id: u64, record_index: u32) -> Option<Event> {
-    let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
+fn ms(ts: DateTime<Utc>) -> i64 {
+    ts.timestamp_millis()
+}
 
-    let ts_ms = parsed.get("ts_ms")?.as_i64()?;
-    let host = parsed.get("host")?.as_str()?.to_string();
+/// Store one fired playbook as a signal plus its explanation.
+fn persist_incident(
+    db: &Connection,
+    controller: &HypothesisController,
+    playbooks: &HashMap<String, PlaybookDef>,
+    hypothesis_id: &str,
+    incident_id: &str,
+    evidence: &mut EvidenceReader,
+) -> Result<String, String> {
+    let hypothesis = controller
+        .get_hypothesis(hypothesis_id)
+        .ok_or_else(|| format!("hypothesis {} not found", hypothesis_id))?;
+    let playbook = playbooks
+        .get(&hypothesis.template_id)
+        .ok_or_else(|| format!("playbook {} not loaded", hypothesis.template_id))?;
+    let incident = controller.get_incident(incident_id);
 
-    let tags: Vec<String> = parsed
-        .get("tags")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut slots = Vec::new();
+    let mut all_ptrs = Vec::new();
+    let mut first_ts: Option<DateTime<Utc>> = None;
+    let mut last_ts: Option<DateTime<Utc>> = None;
+    for slot in &playbook.slots {
+        let fill = hypothesis.slot_fills.get(&slot.slot_id);
+        let mut excerpts = Vec::new();
+        if let Some(fill) = fill {
+            for ptr in &fill.evidence_ptrs {
+                excerpts.push(evidence.excerpt(ptr));
+                all_ptrs.push(json!({
+                    "stream_id": ptr.stream_id,
+                    "segment_id": ptr.segment_id.parse::<u64>().unwrap_or(0),
+                    "record_index": ptr.record_index,
+                    "record_sha256": ptr.record_sha256,
+                }));
+            }
+            first_ts = Some(first_ts.map_or(fill.first_ts, |t| t.min(fill.first_ts)));
+            last_ts = Some(last_ts.map_or(fill.last_ts, |t| t.max(fill.last_ts)));
+        }
+        slots.push(json!({
+            "slot_id": slot.slot_id,
+            "name": slot.name,
+            "required": slot.required,
+            "fact_type": slot.predicate.fact_type,
+            "filled": fill.map(|f| f.satisfied).unwrap_or(false),
+            "evidence": excerpts,
+        }));
+    }
+    let first_ts = first_ts.unwrap_or_else(Utc::now);
+    let last_ts = last_ts.unwrap_or(first_ts);
+    let mitre: Vec<&String> = playbook.tags.iter().filter(|t| t.starts_with('T')).collect();
+    let all_verified = slots
+        .iter()
+        .flat_map(|s| s["evidence"].as_array().cloned().unwrap_or_default())
+        .all(|e| e["verified"] == true);
 
-    // Extract fields from the "fields" object
-    let fields: BTreeMap<String, serde_json::Value> = parsed
-        .get("fields")
-        .and_then(|v| v.as_object())
-        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-        .unwrap_or_default();
-
-    // Build evidence pointer from segment record or construct one
-    let evidence_ptr = parsed.get("evidence_ptr").and_then(|ep| {
-        let stream_id = ep.get("stream_id")?.as_str()?.to_string();
-        let seg_id = ep.get("segment_id")?.as_u64()?;
-        let rec_idx = ep.get("record_index")?.as_u64()? as u32;
-        Some(EvidencePtr {
-            stream_id,
-            segment_id: seg_id,
-            record_index: rec_idx,
-        })
-    }).or_else(|| {
-        // Construct evidence pointer from our position
-        Some(EvidencePtr {
-            stream_id: "openbsm".to_string(),
-            segment_id,
-            record_index,
-        })
+    let explanation = json!({
+        "signal_id": hypothesis_id,
+        "incident_id": incident_id,
+        "playbook_id": playbook.playbook_id,
+        "title": playbook.title,
+        "family": playbook.family,
+        "severity": playbook.severity,
+        "mitre_techniques": mitre,
+        "narrative": playbook.narrative,
+        "scope": hypothesis.scope_key.to_string(),
+        "first_ts": first_ts,
+        "last_ts": last_ts,
+        "slots": slots,
+        "evidence_verified": all_verified,
+        "engine": controller.explain(hypothesis_id),
     });
 
-    Some(Event {
-        ts_ms,
-        host,
-        tags,
-        proc_key: parsed
-            .get("proc_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        file_key: parsed
-            .get("file_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        identity_key: parsed
-            .get("identity_key")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        evidence_ptr,
-        fields,
-    })
+    // Host name as the capture agent recorded it on the first evidence event.
+    let host = slots
+        .iter()
+        .flat_map(|s| s["evidence"].as_array().cloned().unwrap_or_default())
+        .find_map(|e| e["event"]["host"].as_str().map(|h| h.to_string()))
+        .or_else(|| incident.map(|i| i.host_id.clone()))
+        .unwrap_or_default();
+    let metadata = json!({
+        "incident_id": incident_id,
+        "title": playbook.title,
+        "family": playbook.family,
+        "playbook_id": playbook.playbook_id,
+        "mitre_techniques": mitre,
+        "scope": hypothesis.scope_key.to_string(),
+        "narrative": playbook.narrative,
+    });
+    let created_at = Utc::now().to_rfc3339();
+    db.execute(
+        "INSERT OR REPLACE INTO signals
+         (signal_id, signal_type, severity, host, ts, ts_start, ts_end, proc_key, file_key, identity_key,
+          metadata, evidence_ptrs, dropped_evidence_count, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, NULL, ?8, ?9, 0, ?10)",
+        params![
+            hypothesis_id,
+            playbook.playbook_id,
+            playbook.severity,
+            host,
+            ms(last_ts),
+            ms(first_ts),
+            ms(last_ts),
+            metadata.to_string(),
+            Value::Array(all_ptrs).to_string(),
+            created_at
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    db.execute(
+        "INSERT OR REPLACE INTO signal_explanations (signal_id, explanation_json, created_at) VALUES (?1, ?2, ?3)",
+        params![hypothesis_id, explanation.to_string(), created_at],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(playbook.playbook_id.clone())
 }
 
-fn main() {
-    let telemetry_root = get_telemetry_root();
-
-    eprintln!("edr-locald starting (macOS)");
-    eprintln!("TELEMETRY_ROOT: {}", telemetry_root.display());
-
-    // Ensure directories exist
-    let segments_dir = telemetry_root.join("segments");
-    if let Err(e) = fs::create_dir_all(&segments_dir) {
-        eprintln!("ERROR: Failed to create segments dir: {}", e);
-        return;
-    }
-
-    // Initialize SQLite database
-    let db_path = telemetry_root.join("workbench.db");
-    let db = match Connection::open(&db_path) {
-        Ok(conn) => {
-            // Create signals table (same schema as edr-server)
-            let _ = conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS signals (
-                    signal_id TEXT PRIMARY KEY,
-                    signal_type TEXT NOT NULL,
-                    severity TEXT NOT NULL,
-                    host TEXT NOT NULL,
-                    ts INTEGER NOT NULL,
-                    ts_start INTEGER NOT NULL,
-                    ts_end INTEGER NOT NULL,
-                    proc_key TEXT,
-                    file_key TEXT,
-                    identity_key TEXT,
-                    metadata TEXT NOT NULL,
-                    evidence_ptrs TEXT NOT NULL,
-                    dropped_evidence_count INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts DESC);
-                CREATE INDEX IF NOT EXISTS idx_signals_type ON signals(signal_type);
-                CREATE INDEX IF NOT EXISTS idx_signals_host ON signals(host);
-                CREATE INDEX IF NOT EXISTS idx_signals_severity ON signals(severity);
-
-                CREATE TABLE IF NOT EXISTS signal_explanations (
-                    signal_id TEXT PRIMARY KEY,
-                    explanation_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    FOREIGN KEY (signal_id) REFERENCES signals(signal_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_explanations_signal ON signal_explanations(signal_id);
-
-                CREATE TABLE IF NOT EXISTS locald_checkpoint (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );",
-            );
-            eprintln!("Database: {}", db_path.display());
-            conn
-        }
-        Err(e) => {
-            eprintln!("FATAL: Failed to open database: {}", e);
-            return;
-        }
-    };
-
-    // Get hostname
-    let hostname = std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("HOST"))
-        .unwrap_or_else(|_| {
-            std::process::Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        });
-    eprintln!("Host: {}", hostname);
-
-    // Initialize MacOS signal engine
-    let mut signal_engine = MacOSSignalEngine::new(hostname.clone());
-    eprintln!("MacOSSignalEngine: ready");
-
-    // Initialize scoring engine
-    let scoring_engine = ScoringEngine::new(false);
-
-    // Initialize hypothesis controller with macOS playbooks
-    let playbooks = macos_playbooks();
-    let mut hypothesis_controller = HypothesisController::new(&hostname);
-    for playbook in &playbooks {
-        hypothesis_controller.register_playbook(playbook.clone());
-    }
-    eprintln!("HypothesisController: loaded {} macOS playbooks", playbooks.len());
-
-    // Track processed segments
-    let mut seen_segments: HashSet<String> = HashSet::new();
-
-    // Load checkpoint
-    if let Ok(checkpoint) = db.query_row::<String, _, _>(
-        "SELECT value FROM locald_checkpoint WHERE key = 'seen_segments'",
+fn load_checkpoint(db: &Connection) -> BTreeSet<u64> {
+    let mut done = BTreeSet::new();
+    if let Ok(text) = db.query_row::<String, _, _>(
+        "SELECT value FROM locald_checkpoint WHERE key = 'segments_done'",
         [],
         |row| row.get(0),
     ) {
-        for seg in checkpoint.split(',') {
-            if !seg.is_empty() {
-                seen_segments.insert(seg.to_string());
+        for part in text.split(',') {
+            if let Ok(seq) = part.parse::<u64>() {
+                done.insert(seq);
             }
         }
-        eprintln!(
-            "Resumed from checkpoint with {} segments",
-            seen_segments.len()
-        );
+    }
+    done
+}
+
+/// Save the finished segments and the open hypotheses together, so the two
+/// can never disagree after a crash.
+fn save_checkpoint(db: &Connection, done: &BTreeSet<u64>, controller: &HypothesisController) -> Result<(), String> {
+    let text: Vec<String> = done.iter().map(|s| s.to_string()).collect();
+    let snapshot = serde_json::to_string(&controller.snapshot()).map_err(|e| e.to_string())?;
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO locald_checkpoint (key, value) VALUES ('segments_done', ?1)",
+        params![text.join(",")],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT OR REPLACE INTO locald_checkpoint (key, value) VALUES ('controller_state', ?1)",
+        params![snapshot],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
+}
+
+fn load_controller_state(db: &Connection) -> Option<ControllerSnapshot> {
+    let text: String = db
+        .query_row(
+            "SELECT value FROM locald_checkpoint WHERE key = 'controller_state'",
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    match serde_json::from_str(&text) {
+        Ok(snapshot) => Some(snapshot),
+        Err(e) => {
+            eprintln!("[locald] saved state does not parse, starting empty: {}", e);
+            None
+        }
+    }
+}
+
+/// Signals already in the database, so a restored hypothesis is not stored twice.
+fn stored_signal_ids(db: &Connection) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    if let Ok(mut stmt) = db.prepare("SELECT signal_id FROM signals") {
+        if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
+            for id in rows.flatten() {
+                ids.insert(id);
+            }
+        }
+    }
+    ids
+}
+
+fn main() {
+    let args = match parse_args() {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            print!("{}", USAGE);
+            return;
+        }
+        Err(e) => {
+            eprintln!("error: {}\n\n{}", e, USAGE);
+            std::process::exit(2);
+        }
+    };
+    let root = args.telemetry_root.clone();
+    if let Err(e) = fs::create_dir_all(root.join("segments")) {
+        eprintln!("[locald] error: cannot create {}: {}", root.display(), e);
+        std::process::exit(1);
     }
 
-    // Setup graceful shutdown
+    let playbook_list = match &args.playbook_dir {
+        Some(dir) => match load_playbooks_from_dir(dir) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[locald] error: {}", e);
+                std::process::exit(1);
+            }
+        },
+        None => macos_playbooks(),
+    };
+    let db_path = root.join("workbench.db");
+    let db = match open_db(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[locald] error: cannot open {}: {}", db_path.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("[locald] telemetry root: {}", root.display());
+    eprintln!(
+        "[locald] {} playbooks loaded from {}",
+        playbook_list.len(),
+        args.playbook_dir
+            .as_ref()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| "the built in set".to_string())
+    );
+
+    let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
+    let mut controller = HypothesisController::new(&host);
+    let mut playbooks = HashMap::new();
+    for playbook in playbook_list {
+        controller.register_playbook(playbook.clone());
+        playbooks.insert(playbook.playbook_id.clone(), playbook);
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
-    ctrlc::set_handler(move || {
-        eprintln!("\n[locald] Shutting down...");
-        shutdown_clone.store(true, Ordering::Relaxed);
-    })
-    .ok();
+    let flag = shutdown.clone();
+    let _ = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst));
 
-    let index_path = telemetry_root.join("index.json");
-    eprintln!("Watching: {}", index_path.display());
-    eprintln!("(Press Ctrl+C to stop)");
-
+    let mut done = load_checkpoint(&db);
+    let mut persisted: BTreeSet<String> = stored_signal_ids(&db);
+    if let Some(snapshot) = load_controller_state(&db) {
+        let restored = controller.restore(snapshot);
+        eprintln!(
+            "[locald] restored {} open hypotheses, {} segments already done",
+            restored,
+            done.len()
+        );
+    }
     let mut total_events = 0u64;
-    let mut total_signals = 0u64;
+    let mut total_incidents = 0u64;
+    let index_path = root.join("index.json");
 
-    // Main loop
-    while !shutdown.load(Ordering::Relaxed) {
-        // Read index.json
-        if let Ok(index_content) = fs::read_to_string(&index_path) {
-            if let Ok(index) = serde_json::from_str::<SegmentIndex>(&index_content) {
-                for entry in &index.segments {
-                    let entry_path = match entry.get_path() {
-                        Some(p) => p.to_string(),
-                        None => continue,
+    while !shutdown.load(Ordering::SeqCst) {
+        let index: Option<SegmentIndex> = fs::read_to_string(&index_path)
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok());
+        if let Some(index) = index {
+            let mut segments = index.segments.clone();
+            segments.sort_by_key(|s| s.seq);
+            let mut evidence = EvidenceReader {
+                root: root.clone(),
+                paths: segments.iter().map(|s| (s.seq, s.rel_path.clone())).collect(),
+                cache: HashMap::new(),
+            };
+            for seg in segments {
+                if done.contains(&seg.seq) {
+                    continue;
+                }
+                let path = root.join(&seg.rel_path);
+                let bytes = match fs::read(&path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                // The index records a SHA-256 per segment. A mismatch means
+                // the file changed after capture wrote it.
+                if let Some(expected) = &seg.sha256_segment {
+                    let actual = sha256_hex(&bytes);
+                    if &actual != expected {
+                        eprintln!(
+                            "[locald] segment {} hash mismatch (index {}, file {}), skipped",
+                            seg.rel_path, expected, actual
+                        );
+                        done.insert(seg.seq);
+                        continue;
+                    }
+                }
+                let text = String::from_utf8_lossy(&bytes);
+                let mut segment_events = 0u64;
+                let mut segment_incidents = 0u64;
+                for line in text.lines() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let event: Event = match serde_json::from_str(line) {
+                        Ok(e) => e,
+                        Err(_) => continue,
                     };
-
-                    if seen_segments.contains(&entry_path) {
-                        continue;
-                    }
-
-                    let segment_path = telemetry_root.join(&entry_path);
-                    if !segment_path.exists() {
-                        continue;
-                    }
-
-                    // Extract segment_id from filename (UUID or numeric)
-                    let segment_id: u64 = segment_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .and_then(|s| {
-                            // Try parsing as number first
-                            s.parse::<u64>().ok().or_else(|| {
-                                // Use hash of UUID string as segment_id
-                                use std::hash::{Hash, Hasher};
-                                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                                s.hash(&mut hasher);
-                                Some(hasher.finish())
-                            })
-                        })
-                        .unwrap_or(0);
-
-                    eprintln!("[ingest] Processing: {}", entry_path);
-
-                    if let Ok(content) = fs::read_to_string(&segment_path) {
-                        let mut segment_events = 0u32;
-                        let mut segment_signals = 0u32;
-
-                        for (record_index, line) in content.lines().enumerate() {
-                            if line.trim().is_empty() {
+                    segment_events += 1;
+                    let line_hash = sha256_hex(line.as_bytes());
+                    for fact in extract_facts_with_hash(&event, Some(line_hash)) {
+                        let affected = match controller.ingest_fact(fact) {
+                            Ok(ids) => ids,
+                            Err(e) => {
+                                eprintln!("[locald] fact rejected: {}", e);
                                 continue;
                             }
-
-                            if let Some(event) =
-                                parse_segment_record(line, segment_id, record_index as u32)
-                            {
-                                segment_events += 1;
-
-                                // Extract facts for hypothesis controller
-                                let facts = extract_facts(&event);
-                                for fact in facts {
-                                    // Feed to hypothesis controller (returns affected hypothesis IDs)
-                                    match hypothesis_controller.ingest_fact(fact.clone()) {
-                                        Ok(hypothesis_ids) => {
-                                            for hyp_id in hypothesis_ids {
-                                                // Check if hypothesis was promoted to incident
-                                                // The incident ID is derived from hypothesis ID
-                                                if let Some(hypothesis) = hypothesis_controller.get_hypothesis(&hyp_id) {
-                                                    if let Some(incident_id) = &hypothesis.absorbed_into_incident_id {
-                                                        // Generate explanation using built-in API
-                                                        if let Some(explanation) = hypothesis_controller.explain_incident(incident_id) {
-                                                            let explanation_json = serde_json::to_string(&explanation)
-                                                                .unwrap_or_else(|_| "{}".to_string());
-                                                            let created_at = Utc::now().to_rfc3339();
-                                                            let _ = db.execute(
-                                                                "INSERT OR REPLACE INTO signal_explanations (signal_id, explanation_json, created_at) VALUES (?1, ?2, ?3)",
-                                                                params![incident_id, explanation_json, created_at],
-                                                            );
-                                                            eprintln!(
-                                                                "  [incident] {} (explanation stored)",
-                                                                incident_id
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("  [hypothesis error] {}", e);
-                                        }
-                                    }
+                        };
+                        for hypothesis_id in affected {
+                            let incident_id = controller
+                                .get_hypothesis(&hypothesis_id)
+                                .and_then(|h| h.absorbed_into_incident_id.clone());
+                            let incident_id = match incident_id {
+                                Some(id) => id,
+                                None => continue,
+                            };
+                            if persisted.contains(&hypothesis_id) {
+                                continue;
+                            }
+                            match persist_incident(&db, &controller, &playbooks, &hypothesis_id, &incident_id, &mut evidence) {
+                                Ok(playbook_id) => {
+                                    eprintln!("[locald] {} fired: signal {} in incident {}", playbook_id, hypothesis_id, incident_id);
+                                    persisted.insert(hypothesis_id.clone());
+                                    segment_incidents += 1;
                                 }
-
-                                // Process event through MacOSSignalEngine
-                                let signals = signal_engine.process_event(&event);
-                                for signal in signals {
-                                    segment_signals += 1;
-                                    
-                                    // Score the signal
-                                    let scored = scoring_engine.score(signal.clone());
-                                    
-                                    // Persist to database
-                                    persist_signal(&db, &scored.signal);
-
-                                    eprintln!(
-                                        "  [signal] {} severity={} risk={:.2}",
-                                        scored.signal.signal_type,
-                                        scored.signal.severity,
-                                        scored.risk_score
-                                    );
-                                }
+                                Err(e) => eprintln!("[locald] could not store signal {}: {}", hypothesis_id, e),
                             }
                         }
-
-                        total_events += segment_events as u64;
-                        total_signals += segment_signals as u64;
-
-                        eprintln!(
-                            "  [done] {} events, {} signals (total: {} events, {} signals)",
-                            segment_events, segment_signals, total_events, total_signals
-                        );
                     }
-
-                    seen_segments.insert(entry_path.clone());
-
-                    // Save checkpoint
-                    let checkpoint = seen_segments.iter().cloned().collect::<Vec<_>>().join(",");
-                    let _ = db.execute(
-                        "INSERT OR REPLACE INTO locald_checkpoint (key, value) VALUES ('seen_segments', ?1)",
-                        params![checkpoint],
-                    );
+                }
+                total_events += segment_events;
+                total_incidents += segment_incidents;
+                eprintln!(
+                    "[locald] {}: {} events, {} detections",
+                    seg.rel_path, segment_events, segment_incidents
+                );
+                done.insert(seg.seq);
+                if let Err(e) = save_checkpoint(&db, &done, &controller) {
+                    eprintln!("[locald] could not save checkpoint: {}", e);
                 }
             }
         }
-
-        // Poll every 2 seconds
+        if args.once {
+            break;
+        }
         std::thread::sleep(Duration::from_secs(2));
     }
 
     eprintln!(
-        "edr-locald stopped. Total: {} events, {} signals",
-        total_events, total_signals
-    );
-}
-
-/// Persist a signal to the database
-fn persist_signal(db: &Connection, signal: &edr_locald::SignalResult) {
-    let evidence_json =
-        serde_json::to_string(&signal.evidence_ptrs).unwrap_or_else(|_| "[]".to_string());
-    let metadata_json = signal.metadata.to_string();
-    let created_at = Utc::now().to_rfc3339();
-
-    let _ = db.execute(
-        "INSERT OR REPLACE INTO signals
-         (signal_id, signal_type, severity, host, ts, ts_start, ts_end, proc_key, file_key, identity_key, metadata, evidence_ptrs, dropped_evidence_count, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        params![
-            signal.signal_id,
-            signal.signal_type,
-            signal.severity,
-            signal.host,
-            signal.ts,
-            signal.ts_start,
-            signal.ts_end,
-            signal.proc_key,
-            signal.file_key,
-            signal.identity_key,
-            metadata_json,
-            evidence_json,
-            signal.dropped_evidence_count,
-            created_at
-        ],
+        "[locald] stopped: {} events, {} detections this run",
+        total_events, total_incidents
     );
 }

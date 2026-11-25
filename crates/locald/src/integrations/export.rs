@@ -431,6 +431,7 @@ fn severity_to_level(severity: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::integrations::config::ExportSinkType;
     use crate::hypothesis::{Incident, IncidentStatus, Severity, TimelineEntry, TimelineEntryKind};
     use std::collections::HashSet;
     use tempfile::tempdir;

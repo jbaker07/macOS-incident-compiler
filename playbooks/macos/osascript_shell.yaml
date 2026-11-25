@@ -1,0 +1,18 @@
+playbook_id: macos_osascript_shell
+title: AppleScript used to run shell commands
+family: execution
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [execution, osascript, T1059.002]
+narrative: osascript ran inline AppleScript that calls do shell script, a common way for macOS malware to run commands and show fake password prompts.
+slots:
+  - slot_id: osascript_inline
+    name: osascript -e with do shell script
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/bin/osascript$'
+      cmdline_regex: 'do shell script'

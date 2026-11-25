@@ -1,0 +1,24 @@
+playbook_id: macos_writable_exec_then_egress
+title: Program from a writable folder ran and made an outbound connection
+family: command_and_control
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 600
+cooldown_seconds: 300
+tags: [command_and_control, T1105, T1071]
+narrative: A binary in a world writable folder was executed and that same binary opened an outbound network connection in the same login session.
+slots:
+  - slot_id: writable_exec
+    name: Exec of a binary in a writable folder
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: Exec
+      path_regex: '^/(private/)?(tmp|var/tmp)/|^/private/var/folders/|^/Users/Shared/'
+  - slot_id: egress
+    name: Outbound connect by a binary in a writable folder
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: OutboundConnect
+      actor_exe_regex: '^/(private/)?(tmp|var/tmp)/|^/private/var/folders/|^/Users/Shared/'

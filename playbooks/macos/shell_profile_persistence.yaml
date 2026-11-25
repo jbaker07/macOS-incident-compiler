@@ -1,0 +1,18 @@
+playbook_id: macos_shell_profile_persistence
+title: Shell startup file written by a program that is not an editor
+family: persistence
+severity: LOW
+entity_scope: host|user
+ttl_seconds: 600
+cooldown_seconds: 300
+tags: [persistence, shell_profile, T1546.004]
+narrative: A zsh or bash startup file was written by something other than a text editor. Every new terminal runs these files.
+slots:
+  - slot_id: profile_write
+    name: Write of .zshrc, .zprofile, .zshenv, .bash_profile, .bashrc or .profile
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: PersistArtifact
+      path_regex: '/\.(zshrc|zprofile|zshenv|bash_profile|bashrc|profile)$'
+      actor_exe_not_regex: '/(vim|nvim|nano|emacs|code|TextEdit|BBEdit)$|\.app/'

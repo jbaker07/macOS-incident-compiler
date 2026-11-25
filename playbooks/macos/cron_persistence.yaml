@@ -1,0 +1,17 @@
+playbook_id: macos_cron_persistence
+title: Crontab written
+family: persistence
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 600
+cooldown_seconds: 300
+tags: [persistence, cron, T1053.003]
+narrative: A user crontab or /etc/crontab was written. cron is rarely used on current macOS, so a new entry stands out.
+slots:
+  - slot_id: crontab_write
+    name: Write under /usr/lib/cron/tabs or /private/var/at/tabs, or to /etc/crontab
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: PersistArtifact
+      path_regex: '^(/usr/lib/cron/tabs/|/private/var/at/tabs/|/var/at/tabs/|/private/etc/crontab$|/etc/crontab$)'

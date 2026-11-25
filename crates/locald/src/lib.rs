@@ -1,50 +1,13 @@
-//! EDR Local Detection Daemon
+//! edr-locald library.
 //!
-//! The locald crate provides the signal detection and orchestration layer.
-//! It processes Events from agents, runs detection logic, and persists signals.
+//! The `edr-locald` binary (src/main.rs) uses three parts of this crate:
 //!
-//! ## Architecture
-//!
-//! ```text
-//!  ┌─────────────────────────────────────────────────────────────┐
-//!  │                         locald                              │
-//!  │                                                             │
-//!  │   ┌─────────────┐    ┌─────────────────┐    ┌───────────┐  │
-//!  │   │  Pipeline   │───▶│  Orchestrator   │───▶│   Sinks   │  │
-//!  │   │ (normalize) │    │ (detect/route)  │    │ (persist) │  │
-//!  │   └─────────────┘    └────────┬────────┘    └───────────┘  │
-//!  │                               │                             │
-//!  │           ┌───────────────────┼───────────────────┐         │
-//!  │           ▼                   ▼                   ▼         │
-//!  │   ┌───────────────┐  ┌───────────────┐  ┌───────────────┐  │
-//!  │   │ MacOS Engine  │  │ Linux Engine  │  │Windows Engine │  │
-//!  │   └───────────────┘  └───────────────┘  └───────────────┘  │
-//!  └─────────────────────────────────────────────────────────────┘
-//! ```
-//!
-//! ## Usage
-//!
-//! ```ignore
-//! use edr_locald::{Pipeline, Platform, MemorySink};
-//! use std::sync::Arc;
-//!
-//! let mut pipeline = Pipeline::new("hostname", Platform::MacOS);
-//! pipeline.add_sink(Arc::new(MemorySink::new()));
-//!
-//! // Process telemetry from agents
-//! let signals = pipeline.process(telemetry_input);
-//! ```
+//! - `os::macos::fact_extractor` turns capture events into canonical facts
+//! - `os::macos::playbooks` loads the YAML playbooks in playbooks/macos
+//! - `hypothesis_controller` fills playbook slots with facts and promotes a
+//!   hypothesis to an incident when every required slot is filled
 
 pub mod os;
-pub mod pipeline;
-pub mod signal_orchestrator;
-pub mod signal_result;
-
-// Platform-agnostic modules
-pub mod baseline;
-pub mod playbook_loader;
-pub mod scoring;
-pub mod signal_persistence;
 
 // Slot matcher: playbook slot matching engine
 pub mod slot_matcher;
@@ -72,26 +35,8 @@ pub mod explanation_builder;
 // Integration layer: export incidents + ingest third-party alerts
 pub mod integrations;
 
-// Main daemon - has legacy dependencies, skip for now
-// pub mod edr_locald;
-
-pub use os::linux::LinuxSignalEngine;
-pub use os::macos::MacOSSignalEngine;
-pub use os::windows::WindowsSignalEngine;
-pub use pipeline::{
-    AsyncPipelineRunner, HttpSink, LogSink, MemorySink, Pipeline, PipelineStats, SignalSink,
-    TelemetryInput,
-};
-pub use signal_orchestrator::{Platform, SignalOrchestrator};
-pub use signal_result::{EvidenceRef, SignalResult};
-
-// Re-export scoring and baseline types
-pub use baseline::{BaselineQuery, BaselineStore, BaselineUpdater, HostBaseline};
-pub use playbook_loader::{load_playbook_paths, Platform as PlaybookPlatform};
-pub use scoring::{ScoredSignal, ScoringEngine};
-
 // Re-export hypothesis controller
-pub use hypothesis_controller::HypothesisController;
+pub use hypothesis_controller::{ControllerSnapshot, HypothesisController};
 
 // Re-export slot matcher types
 pub use slot_matcher::{

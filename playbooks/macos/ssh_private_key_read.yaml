@@ -1,0 +1,18 @@
+playbook_id: macos_ssh_private_key_read
+title: SSH private key read by a program that is not an SSH tool
+family: credential_access
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [credential_access, ssh, T1552.004]
+narrative: A private key under ~/.ssh was opened for reading by a program other than the OpenSSH tools.
+slots:
+  - slot_id: key_read
+    name: Read of ~/.ssh/id_*
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: ReadPath
+      path_regex: '/\.ssh/id_[A-Za-z0-9_]+$'
+      actor_exe_not_regex: '^/usr/bin/(ssh|ssh-add|ssh-agent|ssh-keygen|scp|sftp)$'

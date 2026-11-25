@@ -1,0 +1,18 @@
+playbook_id: macos_audit_disabled
+title: Audit subsystem told to stop
+family: defense_evasion
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, audit, T1562.001]
+narrative: audit -t asks auditd to stop. This is the sensor this project depends on, so it is the first thing a careful attacker would turn off.
+slots:
+  - slot_id: audit_stop
+    name: audit -t
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/sbin/audit$'
+      cmdline_regex: '(^|\s)-t(\s|$)'

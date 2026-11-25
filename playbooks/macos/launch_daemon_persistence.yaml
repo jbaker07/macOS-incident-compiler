@@ -1,0 +1,17 @@
+playbook_id: macos_launch_daemon_persistence
+title: LaunchDaemon property list written
+family: persistence
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 600
+cooldown_seconds: 300
+tags: [persistence, launch_daemon, T1543.004]
+narrative: A property list was created, written or moved into /Library/LaunchDaemons. launchd runs it as root at boot.
+slots:
+  - slot_id: plist_write
+    name: Write of a LaunchDaemons plist
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: PersistArtifact
+      path_regex: '^/Library/LaunchDaemons/[^/]+\.plist$'

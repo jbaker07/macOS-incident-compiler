@@ -1,0 +1,18 @@
+playbook_id: macos_tcc_database_access
+title: Privacy database (TCC.db) opened by a program other than tccd
+family: defense_evasion
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, tcc, T1548.006]
+narrative: TCC.db holds the camera, microphone, screen recording and file access grants. Only tccd should open it. Failed attempts count too, because they show intent.
+slots:
+  - slot_id: tcc_open
+    name: Open of a TCC.db file
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: ReadPath
+      path_regex: '/com\.apple\.TCC/TCC\.db$'
+      actor_exe_not_regex: '^/System/Library/PrivateFrameworks/TCC\.framework/|^/usr/libexec/tccd$'

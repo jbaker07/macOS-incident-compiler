@@ -1,0 +1,18 @@
+playbook_id: macos_keychain_dump
+title: Keychain items read with the security tool
+family: credential_access
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [credential_access, keychain, T1555.001]
+narrative: The security command line tool was run with a subcommand that prints keychain secrets.
+slots:
+  - slot_id: security_dump
+    name: security dump-keychain, find-generic-password, find-internet-password or export
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/bin/security$'
+      cmdline_regex: '\b(dump-keychain|find-generic-password|find-internet-password|export)\b'

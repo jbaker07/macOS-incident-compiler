@@ -1,0 +1,18 @@
+playbook_id: macos_quarantine_attribute_removed
+title: Quarantine attribute stripped with xattr
+family: defense_evasion
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, gatekeeper, T1553.001]
+narrative: xattr was used to remove com.apple.quarantine, so Gatekeeper will not check the file on first launch. BSM does not audit setxattr or removexattr, so the xattr command is the visible part.
+slots:
+  - slot_id: xattr_strip
+    name: xattr -d com.apple.quarantine or xattr -c
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/bin/xattr$'
+      cmdline_regex: '-[a-z]*d[a-z]*\s+com\.apple\.quarantine|\s-[a-z]*c[a-z]*(\s|$)'

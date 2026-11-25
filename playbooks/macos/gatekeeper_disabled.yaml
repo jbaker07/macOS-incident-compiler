@@ -1,0 +1,18 @@
+playbook_id: macos_gatekeeper_disabled
+title: Gatekeeper turned off with spctl
+family: defense_evasion
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, gatekeeper, T1562.001]
+narrative: spctl was run with --master-disable, --global-disable or --disable, which turns off Gatekeeper assessment for downloaded apps.
+slots:
+  - slot_id: spctl_disable
+    name: spctl --master-disable, --global-disable or --disable
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: Exec
+      path_regex: '^/usr/sbin/spctl$'
+      cmdline_regex: '--(master-disable|global-disable|disable)\b'

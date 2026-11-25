@@ -1,0 +1,25 @@
+playbook_id: macos_launchd_plist_written_then_loaded
+title: Launchd plist written and loaded in the same login session
+family: persistence
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 600
+cooldown_seconds: 300
+tags: [persistence, launchctl, T1543.001, T1569.001]
+narrative: A LaunchAgent or LaunchDaemon plist was written and launchctl was run to load it from the same login session. Loading right away means the attacker did not want to wait for a reboot.
+slots:
+  - slot_id: plist_write
+    name: Write of a LaunchAgents or LaunchDaemons plist
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: PersistArtifact
+      path_regex: '/Library/Launch(Agents|Daemons)/[^/]+\.plist$'
+  - slot_id: launchctl_load
+    name: launchctl load, bootstrap, enable or kickstart
+    required: true
+    ttl_seconds: 600
+    predicate:
+      fact_type: Exec
+      path_regex: '^/bin/launchctl$'
+      cmdline_regex: '\b(load|bootstrap|enable|kickstart)\b'

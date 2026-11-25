@@ -1,0 +1,17 @@
+playbook_id: macos_system_log_deletion
+title: System log or audit trail deleted
+family: defense_evasion
+severity: HIGH
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, T1070.002]
+narrative: A file under /var/log, /var/audit or the unified log store was deleted. newsyslog rotates logs by renaming, not by deleting them.
+slots:
+  - slot_id: log_delete
+    name: Delete under /var/log, /var/audit or /private/var/db/diagnostics
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: DeletePath
+      path_regex: '^/(private/)?var/(log|audit)/|^/private/var/db/diagnostics/'

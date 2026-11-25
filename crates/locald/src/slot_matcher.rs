@@ -106,6 +106,15 @@ pub struct SlotPredicate {
     /// Optional exe name filter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exe_filter: Option<String>,
+    /// Optional regex on the command line of an Exec fact
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline_regex: Option<String>,
+    /// Optional regex the acting process's executable must match
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_exe_regex: Option<String>,
+    /// Optional regex the acting process's executable must not match
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_exe_not_regex: Option<String>,
     /// Optional port filter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dst_port: Option<u16>,
@@ -131,6 +140,9 @@ impl SlotPredicate {
             path_glob: None,
             path_regex: None,
             exe_filter: None,
+            cmdline_regex: None,
+            actor_exe_regex: None,
+            actor_exe_not_regex: None,
             dst_port: None,
             port_range: None,
             mitre_tags: Vec::new(),
@@ -479,6 +491,46 @@ impl SlotMatcher {
                 }
             } else {
                 return None;
+            }
+        }
+
+        // Command line regex (Exec facts only)
+        if let Some(regex_pattern) = &pred.cmdline_regex {
+            let cmdline = match &fact.fact_type {
+                FactType::Exec { cmdline, .. } => cmdline.clone()?,
+                FactType::ShellCommand { command, .. } => command.clone(),
+                _ => return None,
+            };
+            match regex::Regex::new(regex_pattern) {
+                Ok(re) => {
+                    if !re.is_match(&cmdline) {
+                        return None;
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+
+        // Acting process filters. The extractor stores the exe of the process
+        // behind each fact in extra_fields["actor_exe"].
+        let actor_exe = fact.extra_fields.get("actor_exe").and_then(|v| v.as_str());
+        if let Some(regex_pattern) = &pred.actor_exe_regex {
+            let exe = actor_exe?;
+            match regex::Regex::new(regex_pattern) {
+                Ok(re) if re.is_match(exe) => {}
+                _ => return None,
+            }
+        }
+        if let Some(regex_pattern) = &pred.actor_exe_not_regex {
+            match regex::Regex::new(regex_pattern) {
+                Ok(re) => {
+                    if let Some(exe) = actor_exe {
+                        if re.is_match(exe) {
+                            return None;
+                        }
+                    }
+                }
+                Err(_) => return None,
             }
         }
 

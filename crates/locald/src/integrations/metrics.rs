@@ -390,7 +390,7 @@ impl IntegrationMetrics {
         s.push_str(&format!("  Generated: {}\n", report.generated_at));
         s.push_str("═══════════════════════════════════════════════════════════════\n\n");
 
-        s.push_str("📊 SUMMARY\n");
+        s.push_str("SUMMARY\n");
         s.push_str("───────────────────────────────────────────────────────────────\n");
         s.push_str(&format!("  Total Incidents:        {}\n", report.summary.total_incidents));
         s.push_str(&format!("  Average EQS:            {:.2}%\n", report.summary.avg_eqs * 100.0));
@@ -402,7 +402,7 @@ impl IntegrationMetrics {
         s.push_str(&format!("  Duplicate Rate:         {:.2}%\n", report.summary.duplicate_rate * 100.0));
         s.push_str("\n");
 
-        s.push_str("📤 EXPORT METRICS\n");
+        s.push_str("EXPORT METRICS\n");
         s.push_str("───────────────────────────────────────────────────────────────\n");
         s.push_str(&format!("  Incidents Exported:     {}\n", report.export_metrics.incidents_exported));
         s.push_str(&format!("  Incidents Skipped:      {}\n", report.export_metrics.incidents_skipped));
@@ -410,7 +410,7 @@ impl IntegrationMetrics {
         s.push_str(&format!("  Export Hash:            {}\n", &report.export_metrics.export_hash[..16.min(report.export_metrics.export_hash.len())]));
         s.push_str("\n");
 
-        s.push_str("📥 INGEST METRICS\n");
+        s.push_str("INGEST METRICS\n");
         s.push_str("───────────────────────────────────────────────────────────────\n");
         s.push_str(&format!("  Events Read:            {}\n", report.ingest_metrics.events_read));
         s.push_str(&format!("  Events Parsed:          {}\n", report.ingest_metrics.events_parsed));
@@ -421,7 +421,7 @@ impl IntegrationMetrics {
         s.push_str("\n");
 
         if !report.summary.by_family.is_empty() {
-            s.push_str("📁 INCIDENTS BY FAMILY\n");
+            s.push_str("INCIDENTS BY FAMILY\n");
             s.push_str("───────────────────────────────────────────────────────────────\n");
             for (family, count) in &report.summary.by_family {
                 s.push_str(&format!("  {:<25} {}\n", family, count));

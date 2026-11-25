@@ -1,0 +1,17 @@
+playbook_id: macos_shell_history_deletion
+title: Shell history file deleted
+family: defense_evasion
+severity: MEDIUM
+entity_scope: host|user
+ttl_seconds: 300
+cooldown_seconds: 300
+tags: [defense_evasion, T1070.003]
+narrative: A zsh or bash history file was deleted, which removes the record of commands typed in that account.
+slots:
+  - slot_id: history_delete
+    name: Delete of .zsh_history or .bash_history
+    required: true
+    ttl_seconds: 300
+    predicate:
+      fact_type: DeletePath
+      path_regex: '/\.(zsh|bash)_history$'

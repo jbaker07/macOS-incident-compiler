@@ -1,532 +1,357 @@
-//! macOS Fact Extractor
+//! macOS fact extractor.
 //!
-//! Converts macOS BSM/OpenBSM telemetry events to canonical Facts for playbook matching.
-//! Maps BSM event types and tags to the FactType enum variants.
+//! Turns the events that `capture_macos_rotating` writes into canonical
+//! facts for playbook matching. The event schema is documented in
+//! `crates/agent-macos/src/sensors/bsm/bsm_reader.rs`: three tags
+//! `["macos", category, operation]` and flat fields (`pid`, `exe`, `path`,
+//! `cmdline`, `remote_ip` and so on).
+//!
+//! Scope: every fact is keyed to the audit session of the process that made
+//! the call (`auid` plus `asid`). The audit user id is set at login and is
+//! kept across sudo and su, and every process started from one login shares
+//! the session id. That lets a playbook join a file write by `cp`, a
+//! `launchctl load` and a later root action into one hypothesis, because they
+//! all came from the same login.
 
-use crate::hypothesis::canonical_fact::{Fact, FactType, PersistenceType, AuthType};
+use crate::hypothesis::canonical_fact::{Fact, FactType, InjectionType, PersistenceType};
 use crate::hypothesis::{EvidencePtr, ScopeKey};
 use chrono::{DateTime, TimeZone, Utc};
 use edr_core::Event;
 
-/// Extract canonical facts from a macOS BSM event
-///
-/// This is the primary entry point for the fact extraction pipeline.
-/// Maps macOS event tags/fields to canonical FactType variants.
+fn timestamp_from_ms(ms: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
+}
+
+fn str_field<'a>(event: &'a Event, key: &str) -> Option<&'a str> {
+    event.fields.get(key).and_then(|v| v.as_str())
+}
+
+fn u64_field(event: &Event, key: &str) -> Option<u64> {
+    event.fields.get(key).and_then(|v| v.as_u64())
+}
+
+fn succeeded(event: &Event) -> bool {
+    event.fields.get("success").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+/// Session scope when the process has a login (auid), otherwise user scope.
+pub fn scope_for(event: &Event) -> ScopeKey {
+    if let Some(auid) = u64_field(event, "auid") {
+        let asid = u64_field(event, "asid").unwrap_or(0);
+        return ScopeKey::Session {
+            key: format!("{}:auid={}:asid={}", event.host, auid, asid),
+        };
+    }
+    let uid = u64_field(event, "uid").unwrap_or(0);
+    ScopeKey::User {
+        key: format!("{}:uid={}", event.host, uid),
+    }
+}
+
+/// What kind of persistence a path is, if it is one.
+pub fn persistence_type(path: &str) -> Option<PersistenceType> {
+    if path.ends_with(".plist") && path.contains("/Library/LaunchAgents/") {
+        return Some(PersistenceType::LaunchAgent);
+    }
+    if path.ends_with(".plist") && path.contains("/Library/LaunchDaemons/") {
+        return Some(PersistenceType::LaunchDaemon);
+    }
+    if path.starts_with("/usr/lib/cron/tabs/")
+        || path.starts_with("/private/var/at/tabs/")
+        || path.starts_with("/var/at/tabs/")
+        || path == "/etc/crontab"
+        || path == "/private/etc/crontab"
+    {
+        return Some(PersistenceType::CronJob);
+    }
+    if path.ends_with("/.ssh/authorized_keys") {
+        return Some(PersistenceType::SshAuthorizedKey);
+    }
+    let profiles = ["/.zshrc", "/.zprofile", "/.zshenv", "/.bash_profile", "/.bashrc", "/.profile"];
+    for profile in profiles.iter() {
+        if path.ends_with(profile) {
+            return Some(PersistenceType::ShellProfile);
+        }
+    }
+    if path.starts_with("/Library/StartupItems/") || path.starts_with("/private/etc/periodic/") {
+        return Some(PersistenceType::Other("macos_startup".to_string()));
+    }
+    None
+}
+
+/// Extract facts from one capture event.
 pub fn extract_facts(event: &Event) -> Vec<Fact> {
+    extract_facts_with_hash(event, None)
+}
+
+/// Same as `extract_facts`, with the SHA-256 of the segment line that held
+/// the event, so each evidence pointer can be checked against the file.
+pub fn extract_facts_with_hash(event: &Event, record_sha256: Option<String>) -> Vec<Fact> {
     let mut facts = Vec::new();
+    if event.tags.len() < 3 || event.tags[0] != "macos" {
+        return facts;
+    }
+    let category = event.tags[1].as_str();
+    let op = event.tags[2].as_str();
     let ts = timestamp_from_ms(event.ts_ms);
-    let host_id = event.host.clone();
+    let host = event.host.clone();
+    let scope = scope_for(event);
 
-    // Build evidence pointer with timestamp
-    let evidence = match &event.evidence_ptr {
-        Some(ptr) => EvidencePtr::new(
-            ptr.stream_id.clone(),
-            format!("{}", ptr.segment_id),
-            ptr.record_index as u64,
-        )
-        .with_timestamp(ts),
-        None => EvidencePtr::new("unknown", "0", 0).with_timestamp(ts),
-    };
+    let mut evidence = match &event.evidence_ptr {
+        Some(ptr) => EvidencePtr::new(ptr.stream_id.clone(), ptr.segment_id.to_string(), ptr.record_index as u64),
+        None => EvidencePtr::new("unknown", "0", 0),
+    }
+    .with_timestamp(ts);
+    evidence.record_sha256 = record_sha256;
 
-    // Route by tags to appropriate extractors
-    for tag in &event.tags {
-        match tag.as_str() {
-            // Process execution events (AUE_EXECVE, AUE_EXEC, etc.)
-            "process" | "exec" | "execve" | "fork" | "posix_spawn" => {
-                if let Some(fact) = extract_process_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // File operations (AUE_OPEN_*, AUE_CREATE, etc.)
-            "file" | "open" | "create" | "unlink" | "rename" | "write" | "read" => {
-                if let Some(fact) = extract_file_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Credential/auth events (AUE_auth_*, AUE_sudo, etc.)
-            "auth" | "sudo" | "su" | "login" | "logout" => {
-                if let Some(fact) = extract_auth_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Keychain access
-            "keychain" | "security" => {
-                if let Some(fact) = extract_keychain_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Persistence mechanisms
-            "launchd" | "launchagent" | "launchdaemon" | "cron" | "at" => {
-                if let Some(fact) = extract_persistence_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Privilege escalation
-            "setuid" | "setgid" | "privilege" | "priv_escalation" => {
-                if let Some(fact) = extract_privesc_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Defense evasion
-            "xattr" | "quarantine" | "gatekeeper" | "tcc" | "sip" => {
-                if let Some(fact) = extract_evasion_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Network events
-            "network" | "socket" | "connect" | "bind" | "listen" => {
-                if let Some(fact) = extract_network_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Shell command execution
-            "shell" | "bash" | "zsh" | "sh" => {
-                if let Some(fact) = extract_shell_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            // Script execution (osascript, python, etc.)
-            "script" | "osascript" | "python" | "ruby" | "perl" => {
-                if let Some(fact) = extract_script_fact(event, &host_id, &evidence) {
-                    facts.push(fact);
-                }
-            }
-
-            _ => {}
+    // Who did it. Playbooks can match on the actor with actor_exe_regex and
+    // leave out known good tools with actor_exe_not_regex.
+    let mut actor = std::collections::HashMap::new();
+    for key in ["exe", "pid", "ppid", "parent_exe", "auid", "uid", "euid", "success"] {
+        if let Some(value) = event.fields.get(key) {
+            let name = match key {
+                "exe" => "actor_exe".to_string(),
+                "pid" => "actor_pid".to_string(),
+                other => other.to_string(),
+            };
+            actor.insert(name, value.clone());
         }
     }
 
-    // Also check fields for BSM event types
-    if let Some(aue_code) = event.fields.get("aue_code").and_then(|v| v.as_i64()) {
-        if let Some(fact) = extract_from_aue_code(event, aue_code as i32, &host_id, &evidence) {
-            // Deduplicate - only add if not already present
-            let dominated = facts.iter().any(|f| {
-                std::mem::discriminant(&f.fact_type) == std::mem::discriminant(&fact.fact_type)
+    let mut push = |fact_type: FactType| {
+        let mut fact = Fact::new(host.clone(), scope.clone(), fact_type, vec![evidence.clone()]);
+        fact.extra_fields = actor.clone();
+        facts.push(fact);
+    };
+
+    let pid = u64_field(event, "pid").unwrap_or(0);
+
+    match (category, op) {
+        ("process", "exec") => {
+            if !succeeded(event) {
+                return facts;
+            }
+            let path = str_field(event, "exe").unwrap_or("").to_string();
+            if path.is_empty() {
+                return facts;
+            }
+            let signer = str_field(event, "signing_id").filter(|s| !s.is_empty()).map(|s| {
+                match str_field(event, "team_id").filter(|t| !t.is_empty()) {
+                    Some(team) => format!("{} ({})", s, team),
+                    None => s.to_string(),
+                }
             });
-            if !dominated {
-                facts.push(fact);
+            push(FactType::Exec {
+                exe_hash: str_field(event, "cdhash").map(|s| s.to_string()),
+                path,
+                signer,
+                cmdline: str_field(event, "cmdline").map(|s| s.to_string()),
+            });
+            if let Some(ppid) = u64_field(event, "ppid") {
+                push(FactType::ProcSpawn {
+                    parent_proc_key: format!("pid:{}", ppid),
+                    child_proc_key: format!("pid:{}", pid),
+                });
             }
         }
+        ("process", "task_for_pid") | ("process", "ptrace") => {
+            if !succeeded(event) {
+                return facts;
+            }
+            if let Some(target) = u64_field(event, "target_pid") {
+                let injection_type = if op == "ptrace" {
+                    InjectionType::PtraceAttach
+                } else {
+                    InjectionType::Other("task_for_pid".to_string())
+                };
+                push(FactType::Injection {
+                    source_proc_key: format!("pid:{}", pid),
+                    target_proc_key: format!("pid:{}", target),
+                    injection_type,
+                });
+            }
+        }
+        ("file", _) => {
+            let path = match str_field(event, "path") {
+                Some(p) => p.to_string(),
+                None => return facts,
+            };
+            match op {
+                "read" => push(FactType::ReadPath {
+                    path: path.clone(),
+                    inode: u64_field(event, "inode"),
+                    bytes: None,
+                }),
+                "write" | "truncate" => push(FactType::WritePath {
+                    path: path.clone(),
+                    inode: u64_field(event, "inode"),
+                    bytes: None,
+                    entropy: None,
+                }),
+                "create" => push(FactType::CreatePath {
+                    path: path.clone(),
+                    inode: u64_field(event, "inode"),
+                }),
+                "delete" => push(FactType::DeletePath {
+                    path: path.clone(),
+                    inode: u64_field(event, "inode"),
+                }),
+                "rename" => push(FactType::RenamePath {
+                    old_path: path.clone(),
+                    new_path: str_field(event, "new_path").unwrap_or("").to_string(),
+                }),
+                _ => {}
+            }
+
+            if succeeded(event) {
+                // A plist, crontab or profile written or moved into place
+                let target = if op == "rename" {
+                    str_field(event, "new_path").map(|s| s.to_string())
+                } else if op == "create" || op == "write" {
+                    Some(path.clone())
+                } else {
+                    None
+                };
+                if let Some(target) = target {
+                    if let Some(kind) = persistence_type(&target) {
+                        push(FactType::PersistArtifact {
+                            artifact_type: kind,
+                            path_or_key: target,
+                            enable_action: false,
+                        });
+                    }
+                }
+            }
+        }
+        ("privilege", "setuid") | ("privilege", "seteuid") | ("privilege", "setreuid") | ("privilege", "setresuid") => {
+            if !succeeded(event) {
+                return facts;
+            }
+            let before = u64_field(event, "uid").unwrap_or(0) as u32;
+            if let Some(after) = u64_field(event, "target_uid") {
+                if after as u32 != before {
+                    push(FactType::PrivilegeBoundary {
+                        uid_before: before,
+                        uid_after: after as u32,
+                        caps_before: None,
+                        caps_after: None,
+                    });
+                }
+            }
+        }
+        ("network", "connect") => {
+            if let (Some(ip), Some(port)) = (str_field(event, "remote_ip"), u64_field(event, "remote_port")) {
+                push(FactType::OutboundConnect {
+                    dst_ip: ip.to_string(),
+                    dst_port: port as u16,
+                    proto: str_field(event, "family").unwrap_or("inet").to_string(),
+                    sock_id: u64_field(event, "fd").map(|fd| format!("pid:{}:fd:{}", pid, fd)),
+                });
+            }
+        }
+        ("network", "accept") => {
+            if let (Some(ip), Some(port)) = (str_field(event, "remote_ip"), u64_field(event, "remote_port")) {
+                push(FactType::InboundConnect {
+                    src_ip: ip.to_string(),
+                    src_port: port as u16,
+                    proto: str_field(event, "family").unwrap_or("inet").to_string(),
+                    sock_id: None,
+                });
+            }
+        }
+        _ => {}
     }
 
     facts
 }
 
-/// Convert milliseconds timestamp to DateTime
-fn timestamp_from_ms(ms: i64) -> DateTime<Utc> {
-    Utc.timestamp_millis_opt(ms).single().unwrap_or_else(Utc::now)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
-/// Build scope key from host and event
-fn build_scope_key(host_id: &str, event: &Event) -> ScopeKey {
-    // Use ProcScopeKeyBuilder if we have process info
-    if let Some(proc_key) = &event.proc_key {
-        // Parse pid if available
-        let pid = event
-            .fields
-            .get("pid")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        
-        let start_time_ns = event.ts_ms as u64 * 1_000_000; // Convert ms to ns
-        
-        let mut builder = crate::hypothesis::scope_keys::ProcScopeKeyBuilder::new(
-            host_id,
-            start_time_ns,
-            pid,
+    fn event(tags: [&str; 3], fields: serde_json::Value) -> Event {
+        let mut map = BTreeMap::new();
+        for (k, v) in fields.as_object().unwrap() {
+            map.insert(k.clone(), v.clone());
+        }
+        Event {
+            ts_ms: 1_795_446_000_000,
+            host: "test-mac".into(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            proc_key: None,
+            file_key: None,
+            identity_key: None,
+            evidence_ptr: Some(edr_core::EvidencePtr {
+                stream_id: "bsm".into(),
+                segment_id: 3,
+                record_index: 7,
+            }),
+            fields: map,
+        }
+    }
+
+    #[test]
+    fn exec_becomes_exec_and_spawn_facts() {
+        let e = event(
+            ["macos", "process", "exec"],
+            json!({"pid": 10, "ppid": 9, "exe": "/bin/launchctl", "cmdline": "launchctl load x.plist",
+                   "signing_id": "com.apple.xpc.launchctl", "team_id": "", "auid": 501, "asid": 7, "uid": 501, "success": true}),
         );
-        
-        // Add exe hash if available
-        if let Some(hash) = event.fields.get("hash").and_then(|v| v.as_str()) {
-            builder = builder.exe_hash(hash);
+        let facts = extract_facts(&e);
+        assert_eq!(facts.len(), 2);
+        match &facts[0].fact_type {
+            FactType::Exec { path, cmdline, signer, .. } => {
+                assert_eq!(path, "/bin/launchctl");
+                assert_eq!(cmdline.as_deref(), Some("launchctl load x.plist"));
+                assert_eq!(signer.as_deref(), Some("com.apple.xpc.launchctl"));
+            }
+            other => panic!("unexpected {:?}", other),
         }
-        
-        return builder.build();
+        assert_eq!(facts[0].scope_key.to_string(), "session:test-mac:auid=501:asid=7");
+        assert_eq!(facts[0].evidence_ptrs[0].segment_id, "3");
+        assert_eq!(facts[0].evidence_ptrs[0].record_index, 7);
+        assert_eq!(facts[0].extra_fields["actor_exe"], "/bin/launchctl");
     }
-    
-    // Fall back to user scope key if we have user info
-    if let Some(user) = event.fields.get("user").or_else(|| event.fields.get("uid")) {
-        if let Some(user_str) = user.as_str() {
-            return ScopeKey::User { key: format!("{}:{}", host_id, user_str) };
-        }
+
+    #[test]
+    fn launch_agent_create_adds_persistence() {
+        let e = event(
+            ["macos", "file", "create"],
+            json!({"pid": 10, "path": "/Users/alice/Library/LaunchAgents/com.x.plist", "auid": 501, "asid": 7, "success": true}),
+        );
+        let facts = extract_facts(&e);
+        assert!(facts.iter().any(|f| matches!(f.fact_type, FactType::CreatePath { .. })));
+        assert!(facts.iter().any(|f| matches!(
+            &f.fact_type,
+            FactType::PersistArtifact { artifact_type: PersistenceType::LaunchAgent, .. }
+        )));
     }
-    
-    // Default to process scope with just host info
-    ScopeKey::Process { key: format!("{}:unknown", host_id) }
-}
 
-/// Extract process execution fact (maps to Exec)
-fn extract_process_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let path = event
-        .fields
-        .get("path")
-        .or_else(|| event.fields.get("exec_path"))
-        .and_then(|v| v.as_str())?;
+    #[test]
+    fn delete_is_a_delete_fact_and_failed_exec_adds_nothing() {
+        let e = event(
+            ["macos", "file", "delete"],
+            json!({"pid": 10, "path": "/private/var/log/system.log", "auid": 501, "asid": 7, "success": true}),
+        );
+        let facts = extract_facts(&e);
+        assert!(matches!(facts[0].fact_type, FactType::DeletePath { .. }));
 
-    let cmdline = event
-        .fields
-        .get("cmdline")
-        .or_else(|| event.fields.get("args"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        let failed = event(["macos", "process", "exec"], json!({"pid": 10, "exe": "/bin/ls", "success": false}));
+        assert!(extract_facts(&failed).is_empty());
+    }
 
-    let fact_type = FactType::Exec {
-        path: path.to_string(),
-        exe_hash: event.fields.get("hash").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        signer: event.fields.get("signer").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        cmdline,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract file access/modification fact
-fn extract_file_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let path = event
-        .fields
-        .get("path")
-        .or_else(|| event.fields.get("file_path"))
-        .and_then(|v| v.as_str())?;
-
-    let operation = event
-        .fields
-        .get("operation")
-        .and_then(|v| v.as_str())
-        .unwrap_or("read");
-
-    // Map operation to appropriate fact type
-    let fact_type = match operation {
-        "write" | "modify" => FactType::WritePath {
-            path: path.to_string(),
-            inode: event.fields.get("inode").and_then(|v| v.as_u64()),
-            bytes: event.fields.get("bytes").and_then(|v| v.as_u64()),
-            entropy: None,
-        },
-        "create" => FactType::CreatePath {
-            path: path.to_string(),
-            inode: event.fields.get("inode").and_then(|v| v.as_u64()),
-        },
-        "delete" | "unlink" => FactType::DeletePath {
-            path: path.to_string(),
-            inode: event.fields.get("inode").and_then(|v| v.as_u64()),
-        },
-        "rename" => FactType::RenamePath {
-            old_path: path.to_string(),
-            new_path: event.fields.get("new_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        },
-        _ => FactType::ReadPath {
-            path: path.to_string(),
-            inode: event.fields.get("inode").and_then(|v| v.as_u64()),
-            bytes: event.fields.get("bytes").and_then(|v| v.as_u64()),
-        },
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract authentication fact
-fn extract_auth_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let user = event
-        .fields
-        .get("user")
-        .or_else(|| event.fields.get("target_user"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    let success = event
-        .fields
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-
-    let is_sudo = event.tags.iter().any(|t| t == "sudo");
-    let is_su = event.tags.iter().any(|t| t == "su");
-    let is_ssh = event.tags.iter().any(|t| t == "ssh");
-
-    let auth_type = if is_sudo {
-        AuthType::Sudo
-    } else if is_su {
-        AuthType::Su
-    } else if is_ssh {
-        AuthType::Ssh
-    } else {
-        AuthType::Interactive  // Local login on macOS
-    };
-
-    let fact_type = FactType::AuthEvent {
-        user: user.to_string(),
-        auth_type,
-        source: event.fields.get("source_ip").and_then(|v| v.as_str()).map(|s| s.to_string()),
-        success,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract keychain access fact (credential access - maps to ReadPath on keychain)
-fn extract_keychain_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let keychain_path = event
-        .fields
-        .get("keychain")
-        .or_else(|| event.fields.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("~/Library/Keychains/login.keychain-db");
-
-    let fact_type = FactType::ReadPath {
-        path: keychain_path.to_string(),
-        inode: None,
-        bytes: None,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract persistence installation fact
-fn extract_persistence_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let path = event
-        .fields
-        .get("path")
-        .or_else(|| event.fields.get("plist_path"))
-        .and_then(|v| v.as_str())?;
-
-    let artifact_type = if path.contains("LaunchAgents") {
-        PersistenceType::LaunchAgent
-    } else if path.contains("LaunchDaemons") {
-        PersistenceType::LaunchDaemon
-    } else if path.contains("cron") || path.contains("/var/at/") {
-        PersistenceType::CronJob
-    } else {
-        PersistenceType::Other("macos_other".to_string())
-    };
-
-    let fact_type = FactType::PersistArtifact {
-        artifact_type,
-        path_or_key: path.to_string(),
-        enable_action: true,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract privilege escalation fact
-fn extract_privesc_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let uid_before = event
-        .fields
-        .get("uid")
-        .or_else(|| event.fields.get("ruid"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(1000);
-
-    let uid_after = event
-        .fields
-        .get("euid")
-        .or_else(|| event.fields.get("target_uid"))
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32)
-        .unwrap_or(0);
-
-    let fact_type = FactType::PrivilegeBoundary {
-        uid_before,
-        uid_after,
-        caps_before: None,
-        caps_after: None,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract defense evasion fact (maps to SecurityToolDisable or LogTamper)
-fn extract_evasion_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let is_gatekeeper = event.tags.iter().any(|t| t == "gatekeeper" || t == "quarantine" || t == "xattr");
-    let is_tcc = event.tags.iter().any(|t| t == "tcc");
-    let is_sip = event.tags.iter().any(|t| t == "sip");
-
-    let fact_type = if is_gatekeeper {
-        FactType::SecurityToolDisable {
-            tool_name: "Gatekeeper".to_string(),
-            method: "xattr_removal".to_string(),
-        }
-    } else if is_tcc {
-        FactType::SecurityToolDisable {
-            tool_name: "TCC".to_string(),
-            method: "database_manipulation".to_string(),
-        }
-    } else if is_sip {
-        FactType::SecurityToolDisable {
-            tool_name: "SIP".to_string(),
-            method: "csrutil".to_string(),
-        }
-    } else {
-        FactType::SecurityToolDisable {
-            tool_name: "unknown".to_string(),
-            method: "unknown".to_string(),
-        }
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract network connection fact
-fn extract_network_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let dest_ip = event
-        .fields
-        .get("dest_ip")
-        .or_else(|| event.fields.get("remote_addr"))
-        .and_then(|v| v.as_str())?;
-
-    let dest_port = event
-        .fields
-        .get("dest_port")
-        .or_else(|| event.fields.get("remote_port"))
-        .and_then(|v| v.as_i64())
-        .map(|v| v as u16)
-        .unwrap_or(0);
-
-    let protocol = event
-        .fields
-        .get("protocol")
-        .and_then(|v| v.as_str())
-        .unwrap_or("tcp");
-
-    let fact_type = FactType::OutboundConnect {
-        dst_ip: dest_ip.to_string(),
-        dst_port: dest_port,
-        proto: protocol.to_string(),
-        sock_id: None,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract shell command execution fact
-fn extract_shell_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let shell = event
-        .fields
-        .get("shell")
-        .or_else(|| event.fields.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("/bin/sh");
-
-    let command = event
-        .fields
-        .get("cmdline")
-        .or_else(|| event.fields.get("command"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let fact_type = FactType::ShellCommand {
-        shell: shell.to_string(),
-        command: command.to_string(),
-        is_encoded: command.contains("-enc") || command.contains("base64"),
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract script execution fact
-fn extract_script_fact(event: &Event, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    let interpreter = event
-        .fields
-        .get("interpreter")
-        .or_else(|| event.fields.get("path"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("osascript");
-
-    let script_path = event
-        .fields
-        .get("script_path")
-        .or_else(|| event.fields.get("script"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-
-    let fact_type = FactType::ScriptExec {
-        interpreter: interpreter.to_string(),
-        script_path,
-        script_content_hash: None,
-    };
-
-    Some(Fact::new(
-        host_id,
-        build_scope_key(host_id, event),
-        fact_type,
-        vec![evidence.clone()],
-    ))
-}
-
-/// Extract fact based on BSM AUE code
-fn extract_from_aue_code(event: &Event, aue_code: i32, host_id: &str, evidence: &EvidencePtr) -> Option<Fact> {
-    // Map common BSM AUE codes to fact types
-    match aue_code {
-        // Process execution (AUE_EXECVE = 23, AUE_EXEC = 7)
-        7 | 23 | 190 | 191 => extract_process_fact(event, host_id, evidence),
-        
-        // File operations (AUE_OPEN* = 72-77, AUE_CREATE = 4)
-        4 | 72..=77 | 42 | 43 => extract_file_fact(event, host_id, evidence),
-        
-        // Auth events (AUE_auth_user = 45000+)
-        45001..=45100 => extract_auth_fact(event, host_id, evidence),
-        
-        // Socket operations (AUE_SOCKET = 183, AUE_CONNECT = 62)
-        62 | 183 | 184 | 185 => extract_network_fact(event, host_id, evidence),
-        
-        // Setuid/setgid (AUE_SETUID = 200, AUE_SETGID = 201)
-        200 | 201 | 202 | 203 => extract_privesc_fact(event, host_id, evidence),
-        
-        _ => None,
+    #[test]
+    fn setuid_to_a_new_uid_is_a_privilege_boundary() {
+        let e = event(
+            ["macos", "privilege", "setuid"],
+            json!({"pid": 10, "uid": 501, "euid": 0, "target_uid": 0, "auid": 501, "asid": 7, "success": true}),
+        );
+        let facts = extract_facts(&e);
+        assert!(matches!(
+            facts[0].fact_type,
+            FactType::PrivilegeBoundary { uid_before: 501, uid_after: 0, .. }
+        ));
     }
 }
