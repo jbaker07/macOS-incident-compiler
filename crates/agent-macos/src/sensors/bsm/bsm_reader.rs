@@ -1,807 +1,371 @@
-// macos/sensors/bsm/bsm_reader.rs
-// OpenBSM audit log record reader and dispatcher
+//! Turns decoded BSM records into `edr_core::Event` values.
+//!
+//! The capture agent runs as root, so it does as little as possible: decode
+//! the record, name the operation and copy the facts into a flat event.
+//! It makes no detection decisions. Detection lives in `edr-locald` and the
+//! YAML playbooks, which run unprivileged.
+//!
+//! Every event has three tags, `["macos", <category>, <operation>]`:
+//!
+//! | category       | operations |
+//! |----------------|------------|
+//! | `process`      | `exec`, `fork`, `exit`, `kill`, `task_for_pid`, `pid_for_task`, `task_name_for_pid`, `ptrace` |
+//! | `file`         | `read`, `write`, `create`, `delete`, `rename`, `chmod`, `chown`, `truncate`, `link` |
+//! | `privilege`    | `setuid`, `seteuid`, `setreuid`, `setresuid`, `setgid`, `setegid`, `setregid`, `setresgid`, `setgroups`, `setauid`, `setlogin` |
+//! | `network`      | `socket`, `connect`, `accept`, `bind`, `listen` |
+//! | `fs`           | `mount`, `unmount` |
+//! | `audit_config` | `auditon`, `auditctl`, `audit` |
 
+use super::aue::*;
+use super::record::{BsmRecord, AU_DEFAUDITID};
+use crate::sensors::hash_keys;
 use edr_core::Event;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-/// BSM record reader: parses OpenBSM binary format and dispatches to handlers
-pub struct BSMReader {
-    /// Whether reader is initialized
-    pub enabled: bool,
+/// How many pid to executable entries to remember. File and network records
+/// carry only a pid, so the exe comes from the last exec seen for that pid.
+const PID_CACHE_LIMIT: usize = 8192;
+
+/// Category and operation for an event number, or None if the agent does
+/// not handle that event.
+pub fn classify(code: u16) -> Option<(&'static str, &'static str)> {
+    if let Some(variant) = open_variant(code) {
+        let op = if variant.create {
+            "create"
+        } else if variant.write {
+            "write"
+        } else {
+            "read"
+        };
+        return Some(("file", op));
+    }
+    let pair = match code {
+        AUE_EXECVE | AUE_EXEC | AUE_MAC_EXECVE | AUE_POSIX_SPAWN => ("process", "exec"),
+        AUE_FORK | AUE_VFORK => ("process", "fork"),
+        AUE_EXIT => ("process", "exit"),
+        AUE_KILL => ("process", "kill"),
+        AUE_PTRACE => ("process", "ptrace"),
+        AUE_TASKFORPID => ("process", "task_for_pid"),
+        AUE_PIDFORTASK => ("process", "pid_for_task"),
+        AUE_TASKNAMEFORPID => ("process", "task_name_for_pid"),
+
+        AUE_UNLINK | AUE_UNLINKAT | AUE_RMDIR => ("file", "delete"),
+        AUE_RENAME | AUE_RENAMEAT => ("file", "rename"),
+        AUE_CHMOD | AUE_FCHMOD | AUE_LCHMOD | AUE_FCHMODAT | AUE_CHMOD_EXTENDED | AUE_FCHMOD_EXTENDED => {
+            ("file", "chmod")
+        }
+        AUE_CHOWN | AUE_FCHOWN | AUE_LCHOWN | AUE_FCHOWNAT => ("file", "chown"),
+        AUE_TRUNCATE | AUE_FTRUNCATE => ("file", "truncate"),
+        AUE_LINK | AUE_LINKAT | AUE_SYMLINK | AUE_SYMLINKAT | AUE_CLONEFILEAT | AUE_FCLONEFILEAT
+        | AUE_EXCHANGEDATA => ("file", "link"),
+
+        AUE_SETUID => ("privilege", "setuid"),
+        AUE_SETEUID => ("privilege", "seteuid"),
+        AUE_SETREUID => ("privilege", "setreuid"),
+        AUE_SETRESUID => ("privilege", "setresuid"),
+        AUE_SETGID => ("privilege", "setgid"),
+        AUE_SETEGID => ("privilege", "setegid"),
+        AUE_SETREGID => ("privilege", "setregid"),
+        AUE_SETRESGID => ("privilege", "setresgid"),
+        AUE_SETGROUPS => ("privilege", "setgroups"),
+        AUE_SETAUID => ("privilege", "setauid"),
+        AUE_SETLOGIN => ("privilege", "setlogin"),
+
+        AUE_SOCKET => ("network", "socket"),
+        AUE_CONNECT => ("network", "connect"),
+        AUE_ACCEPT => ("network", "accept"),
+        AUE_BIND => ("network", "bind"),
+        AUE_LISTEN => ("network", "listen"),
+
+        AUE_MOUNT | AUE_FMOUNT => ("fs", "mount"),
+        AUE_UNMOUNT => ("fs", "unmount"),
+
+        AUE_AUDITON => ("audit_config", "auditon"),
+        AUE_AUDITCTL => ("audit_config", "auditctl"),
+        AUE_AUDIT => ("audit_config", "audit"),
+        _ => return None,
+    };
+    Some(pair)
 }
 
-impl BSMReader {
-    /// Create new BSM reader
-    pub fn new() -> Self {
-        BSMReader { enabled: false }
-    }
-
-    /// Initialize BSM reader: open /dev/auditpipe or /var/audit/*
-    /// Returns true if successful
-    pub fn initialize(&mut self) -> bool {
-        // TODO: Open /dev/auditpipe (real-time) or /var/audit (on-demand)
-        // Handle permission errors gracefully
-        self.enabled = true;
-        true
-    }
-
-    /// Dispatch BSM event to appropriate handler (public for testing and direct use)
-    pub fn read_record(
-        &self,
-        host: &str,
-        stream_id: &str,
-        segment_id: &str,
-        record_index: usize,
-    ) -> Option<Event> {
-        // TODO: Read from auditpipe
-        // 1. Read BSM header (length + event code)
-        // 2. Read token stream
-        // 3. Dispatch to handler based on AUE code
-        None
-    }
-}
-
-/// Public dispatcher for BSM events (for testing and direct use)
-/// Routes AUE codes to appropriate handler modules
-/// Returns Vec<Event> to support multiple derived events from a single AUE code
-pub fn dispatch_event(
-    aue_code: i32,
+/// Converts records to events and remembers which program each pid runs.
+pub struct Normalizer {
     host: String,
     stream_id: String,
-    segment_id: String,
-    record_index: usize,
-    event_data: Vec<u8>,
-    ts_millis: u64,
-) -> Vec<Event> {
-    let mut events = Vec::new();
-
-    match aue_code {
-        // Process execution (AUE_EXECVE = 59)
-        59 => {
-            let mut evts = crate::sensors::bsm::bsm_exec::handle_exec(
-                host,
-                stream_id,
-                segment_id,
-                record_index,
-                aue_code,
-                event_data,
-                ts_millis,
-            )
-            .unwrap_or_else(|_| Vec::new());
-            events.append(&mut evts);
-        }
-
-        // File operations - route to bsm_file_ops module
-        // AUE_OPEN_R(3), AUE_OPEN_W(4), AUE_OPEN_RW(5), AUE_CREAT(300), AUE_UNLINK(7), AUE_CHMOD(17)
-        3 | 4 | 5 | 6 | 7 | 17 | 18 | 39 | 40 | 300 | 310 | 311 => {
-            // Parse BSM tokens from event_data to extract path, mode, pid, uid
-            use crate::sensors::bsm::{bsm_file_ops, bsm_tokens};
-
-            // Extract subject token for pid/uid/euid
-            let subject =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::SUBJECT_TOKEN_32)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_subject_token(&t));
-
-            let (pid, uid, euid) = match &subject {
-                Some(s) => (
-                    s.pid.unwrap_or(0),
-                    s.uid.unwrap_or(0),
-                    s.euid.or(s.uid).unwrap_or(0),
-                ),
-                None => (0, 0, 0),
-            };
-
-            // Skip events with invalid pid (validation)
-            if pid == 0 {
-                return events; // No valid subject token
-            }
-
-            // Extract path token
-            let path = bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::PATH_TOKEN)
-                .ok()
-                .and_then(|mut v| v.pop())
-                .and_then(|t| bsm_tokens::parse_path_token(&t));
-
-            // Extract second path for rename (if applicable)
-            let dest_path = if aue_code == 6 {
-                // AUE_RENAME
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::PATH_TOKEN)
-                    .ok()
-                    .and_then(|v| if v.len() >= 2 { Some(v) } else { None })
-                    .and_then(|mut v| {
-                        v.pop(); // skip first
-                        v.pop().and_then(|t| bsm_tokens::parse_path_token(&t))
-                    })
-            } else {
-                None
-            };
-
-            // Extract return token for success/failure
-            let success =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::RETURN_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_return_token(&t))
-                    .map(|(err, _ret)| err == 0)
-                    .unwrap_or(true);
-
-            // Extract exe path from text token if available
-            let exe_path = bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::TEXT_TOKEN)
-                .ok()
-                .and_then(|mut v| v.pop())
-                .and_then(|t| bsm_tokens::parse_text_token(&t));
-
-            if let Some(evt) = bsm_file_ops::handle_file_operation_event(
-                &host,
-                &stream_id,
-                &segment_id,
-                record_index,
-                aue_code,
-                pid,
-                uid,
-                euid,
-                path.as_deref(),
-                dest_path.as_deref(),
-                None, // mode - not critical for canonical events
-                None, // target_uid - for chown, extracted separately if needed
-                None, // target_gid - for chown
-                exe_path.as_deref(),
-                success,
-                ts_millis,
-            ) {
-                events.push(evt);
-            }
-        }
-
-        // Privilege escalation - route to bsm_priv_escalation module
-        // AUE_SETUID(24), AUE_SETGID(25), AUE_SETEUID(126), AUE_SETEGID(127),
-        // AUE_SETGROUPS(128), AUE_SETREUID(130), AUE_SETREGID(131)
-        24 | 25 | 126 | 127 | 128 | 130 | 131 => {
-            // Parse BSM tokens from event_data to extract uid/gid transitions
-            use crate::sensors::bsm::{bsm_priv_escalation, bsm_tokens};
-
-            // Extract subject token for pid/uid/euid/gid/egid
-            let subject =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::SUBJECT_TOKEN_32)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_subject_token(&t));
-
-            let (pid, uid, euid, gid, egid) = match &subject {
-                Some(s) => (
-                    s.pid.unwrap_or(0),
-                    s.uid.unwrap_or(0),
-                    s.euid.or(s.uid).unwrap_or(0),
-                    s.gid.unwrap_or(0),
-                    s.egid.or(s.gid).unwrap_or(0),
-                ),
-                None => (0, 0, 0, 0, 0),
-            };
-
-            // Skip events with invalid pid (validation)
-            if pid == 0 {
-                return events;
-            }
-
-            // Extract arg token for target uid/gid value
-            let target_value =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::ARG_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_arg_token(&t))
-                    .map(|(_num, val)| val.parse::<u32>().unwrap_or(0))
-                    .unwrap_or(0);
-
-            // Extract second arg for setreuid/setregid
-            let target_value2 = if aue_code == 130 || aue_code == 131 {
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::ARG_TOKEN)
-                    .ok()
-                    .and_then(|v| if v.len() >= 2 { Some(v) } else { None })
-                    .and_then(|mut v| {
-                        v.pop();
-                        v.pop().and_then(|t| bsm_tokens::parse_arg_token(&t))
-                    })
-                    .map(|(_num, val)| val.parse::<u32>().unwrap_or(0))
-            } else {
-                None
-            };
-
-            // Extract return token for success/failure
-            let success =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::RETURN_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_return_token(&t))
-                    .map(|(err, _ret)| err == 0)
-                    .unwrap_or(true);
-
-            // Extract exe path from text token
-            let exe_path = bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::TEXT_TOKEN)
-                .ok()
-                .and_then(|mut v| v.pop())
-                .and_then(|t| bsm_tokens::parse_text_token(&t));
-
-            if let Some(evt) = bsm_priv_escalation::handle_priv_escalation_event(
-                &host,
-                &stream_id,
-                &segment_id,
-                record_index,
-                aue_code,
-                pid,
-                uid,
-                euid,
-                gid,
-                egid,
-                target_value,
-                target_value2,
-                exe_path.as_deref(),
-                success,
-                ts_millis,
-            ) {
-                events.push(evt);
-            }
-        }
-
-        // Mount operations
-        21 => {
-            if let Some(evt) = crate::sensors::bsm::bsm_fs_ops::handle_mount(
-                host,
-                stream_id,
-                segment_id,
-                record_index,
-                event_data,
-                ts_millis,
-            ) {
-                events.push(evt);
-            }
-        }
-        22 => {
-            if let Some(evt) = crate::sensors::bsm::bsm_fs_ops::handle_unmount(
-                host,
-                stream_id,
-                segment_id,
-                record_index,
-                event_data,
-                ts_millis,
-            ) {
-                events.push(evt);
-            }
-        }
-
-        // Socket/network - route to bsm_network module
-        // AUE_SOCKET(40), AUE_BIND(42), AUE_CONNECT(43), AUE_ACCEPT(44), AUE_LISTEN(45)
-        42 | 43 | 44 | 45 => {
-            // Parse BSM tokens from event_data to extract network info
-            use crate::sensors::bsm::{bsm_network, bsm_tokens};
-
-            // Extract subject token for pid/uid/euid
-            let subject =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::SUBJECT_TOKEN_32)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_subject_token(&t));
-
-            let (pid, uid, euid) = match &subject {
-                Some(s) => (
-                    s.pid.unwrap_or(0),
-                    s.uid.unwrap_or(0),
-                    s.euid.or(s.uid).unwrap_or(0),
-                ),
-                None => (0, 0, 0),
-            };
-
-            // Skip events with invalid pid
-            if pid == 0 {
-                return events;
-            }
-
-            // Extract sockaddr token for IP/port (IPv4)
-            let (remote_ip, remote_port) =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::SOCKADDR_IN_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_sockaddr_ipv4(&t))
-                    .map(|(ip, port)| (Some(ip), Some(port)))
-                    .unwrap_or((None, None));
-
-            // Try IPv6 if no IPv4 found
-            let (remote_ip, remote_port) = if remote_ip.is_none() {
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::SOCKADDR_IN6_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_sockaddr_ipv6(&t))
-                    .map(|(ip, port)| (Some(ip), Some(port)))
-                    .unwrap_or((None, None))
-            } else {
-                (remote_ip, remote_port)
-            };
-
-            // Extract return token for success/failure
-            let success =
-                bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::RETURN_TOKEN)
-                    .ok()
-                    .and_then(|mut v| v.pop())
-                    .and_then(|t| bsm_tokens::parse_return_token(&t))
-                    .map(|(err, _ret)| err == 0)
-                    .unwrap_or(true);
-
-            // Extract exe path from text token
-            let exe_path = bsm_tokens::scan_tokens(&event_data, bsm_tokens::token_type::TEXT_TOKEN)
-                .ok()
-                .and_then(|mut v| v.pop())
-                .and_then(|t| bsm_tokens::parse_text_token(&t));
-
-            if let Some(evt) = bsm_network::handle_network_event(
-                &host,
-                &stream_id,
-                &segment_id,
-                record_index,
-                aue_code,
-                pid,
-                uid,
-                euid,
-                remote_ip.as_deref(),
-                remote_port,
-                None, // local_ip - not always available
-                None, // local_port - not always available
-                exe_path.as_deref(),
-                success,
-                ts_millis,
-            ) {
-                events.push(evt);
-            }
-        }
-
-        _ => {}
-    }
-
-    events
+    exe_by_pid: HashMap<u32, String>,
+    parent_by_pid: HashMap<u32, u32>,
+    insertion_order: VecDeque<u32>,
 }
 
-/// Helper function to derive primitive events from a base event's fields
-/// Emits cred_access, discovery, archive, staging, and net_connect events
-/// when applicable based on the primary event's content
-pub fn derive_primitive_events(base_event: &Event, host: &str, stream_id: &str) -> Vec<Event> {
-    let mut derived = Vec::new();
+impl Normalizer {
+    pub fn new(host: &str, stream_id: &str) -> Self {
+        Normalizer {
+            host: host.to_string(),
+            stream_id: stream_id.to_string(),
+            exe_by_pid: HashMap::new(),
+            parent_by_pid: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
 
-    // Check event tags to determine what primitive detections to run
-    if base_event.tag_contains("exec") {
-        // Extract fields we need for exec-based detectors
-        if let (Some(exe_val), Some(pid_val), Some(uid_val)) = (
-            base_event.fields.get("exe"),
-            base_event.fields.get("pid"),
-            base_event.fields.get("uid"),
-        ) {
-            if let (Some(exe), Some(pid), Some(uid)) =
-                (exe_val.as_str(), pid_val.as_u64(), uid_val.as_u64())
-            {
-                let pid = pid as u32;
-                let uid = uid as u32;
-                let euid = base_event
-                    .fields
-                    .get("euid")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(uid);
-
-                let argv: Vec<String> = base_event
-                    .fields
-                    .get("argv")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                // Try cred access detection
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_cred_access::detect_cred_access_from_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // Try discovery exec detection
-                if let Some(evt) = crate::sensors::bsm::bsm_discovery_exec::detect_discovery_exec(
-                    host,
-                    stream_id,
-                    "",
-                    0,
-                    exe,
-                    &argv,
-                    pid,
-                    uid,
-                    euid,
-                    base_event.ts_ms as u64,
-                ) {
-                    derived.push(evt);
-                }
-
-                // Try archive tool detection
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_archive_tool_exec::detect_archive_tool_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // === NEW DETECTORS ===
-
-                // Try process injection detection from exec
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_process_injection::detect_process_injection_from_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        None,
-                        pid,
-                        uid,
-                        euid,
-                        None,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // Try defense evasion detection from exec
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_defense_evasion::detect_defense_evasion_from_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // Try auth event detection from exec
-                if let Some(evt) = crate::sensors::bsm::bsm_auth_event::detect_auth_event_from_exec(
-                    host,
-                    stream_id,
-                    "",
-                    0,
-                    exe,
-                    &argv,
-                    pid,
-                    uid,
-                    euid,
-                    None,
-                    base_event.ts_ms as u64,
-                ) {
-                    derived.push(evt);
-                }
-
-                // Try script exec detection
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_script_exec::detect_script_exec_from_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // Try LOLBin detection
-                if let Some(evt) = crate::sensors::bsm::bsm_script_exec::detect_lolbin_exec(
-                    host,
-                    stream_id,
-                    "",
-                    0,
-                    exe,
-                    &argv,
-                    pid,
-                    uid,
-                    euid,
-                    base_event.ts_ms as u64,
-                ) {
-                    derived.push(evt);
-                }
-
-                // Try persistence change from exec (launchctl, crontab, etc.)
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_persistence_change::detect_persistence_change_from_exec(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // === HIGH-VALUE COMPOSITE DETECTORS ===
-
-                // Detect code signature bypass pattern (codesign tool + unsigned execution)
-                if let Some(evt) = crate::sensors::bsm::bsm_composite_detectors::detect_code_signature_bypass_with_execution(
-                    host, stream_id, exe, &argv, pid, uid, euid, base_event.ts_ms as u64
-                ) {
-                    derived.push(evt);
-                }
-
-                // Detect keychain credential access chain (security + ssh context)
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_composite_detectors::detect_keychain_to_ssh_chain(
-                        host,
-                        stream_id,
-                        exe,
-                        &argv,
-                        pid,
-                        uid,
-                        euid,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
-                }
-
-                // Detect DYLD injection with unsigned binary execution
-                let env_vars = base_event
-                    .fields
-                    .get("env")
-                    .and_then(|v| v.as_object())
-                    .map(|obj| {
-                        let mut map = std::collections::BTreeMap::new();
-                        for (k, v) in obj {
-                            if let Some(val) = v.as_str() {
-                                map.insert(k.clone(), val.to_string());
-                            }
-                        }
-                        map
-                    });
-
-                if let Some(evt) = crate::sensors::bsm::bsm_composite_detectors::detect_dyld_injection_with_unsigned_binary(
-                    host, stream_id, exe, &argv, env_vars.as_ref(), pid, uid, euid, base_event.ts_ms as u64
-                ) {
-                    derived.push(evt);
-                }
+    fn remember(&mut self, pid: u32, exe: Option<&str>, parent: Option<u32>) {
+        if !self.exe_by_pid.contains_key(&pid) && !self.parent_by_pid.contains_key(&pid) {
+            self.insertion_order.push_back(pid);
+        }
+        if let Some(exe) = exe {
+            self.exe_by_pid.insert(pid, exe.to_string());
+        }
+        if let Some(parent) = parent {
+            self.parent_by_pid.insert(pid, parent);
+        }
+        while self.insertion_order.len() > PID_CACHE_LIMIT {
+            if let Some(old) = self.insertion_order.pop_front() {
+                self.exe_by_pid.remove(&old);
+                self.parent_by_pid.remove(&old);
             }
         }
     }
 
-    // Check for file operations to derive staging write events
-    if base_event.tag_contains("file")
-        && (base_event.tag_contains("write") || base_event.tag_contains("create"))
-    {
-        if let (Some(path_val), Some(pid_val), Some(uid_val)) = (
-            base_event.fields.get("path"),
-            base_event.fields.get("pid"),
-            base_event.fields.get("uid"),
-        ) {
-            if let (Some(path), Some(pid), Some(uid)) =
-                (path_val.as_str(), pid_val.as_u64(), uid_val.as_u64())
-            {
-                let pid = pid as u32;
-                let uid = uid as u32;
-                let euid = base_event
-                    .fields
-                    .get("euid")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(uid);
+    /// Normalize one record. Returns None for event numbers the agent does
+    /// not handle and for records without a subject token.
+    pub fn normalize(&mut self, rec: &BsmRecord) -> Option<Event> {
+        let (category, op) = classify(rec.event)?;
+        let subject = rec.subject.as_ref()?;
 
-                let op = if base_event.tag_contains("write") {
-                    "write"
-                } else {
-                    "create"
-                };
-                let exe_path = base_event
-                    .fields
-                    .get("exe")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+        let mut fields: BTreeMap<String, Value> = BTreeMap::new();
+        fields.insert("aue_code".into(), json!(rec.event));
+        if let Some(name) = event_name(rec.event) {
+            fields.insert("aue_name".into(), json!(name));
+        }
+        fields.insert("op".into(), json!(op));
+        fields.insert("success".into(), json!(rec.success()));
+        if let Some(ret) = &rec.ret {
+            if ret.error != 0 {
+                fields.insert("errno".into(), json!(ret.error));
+            }
+        }
 
-                if let Some(evt) = crate::sensors::bsm::bsm_staging_write::detect_staging_write(
-                    host,
-                    stream_id,
-                    "",
-                    0,
-                    path,
-                    "",
-                    pid,
-                    uid,
-                    euid,
-                    op,
-                    base_event.ts_ms as u64,
-                ) {
-                    derived.push(evt);
+        // Subject. ruid is the user who started the process, euid is the
+        // identity the kernel checked. auid is the login user and survives
+        // sudo, which is why playbooks scope on it.
+        let mut pid = subject.pid;
+        fields.insert("uid".into(), json!(subject.ruid));
+        fields.insert("euid".into(), json!(subject.euid));
+        fields.insert("gid".into(), json!(subject.rgid));
+        fields.insert("egid".into(), json!(subject.egid));
+        if subject.auid != AU_DEFAUDITID {
+            fields.insert("auid".into(), json!(subject.auid));
+        }
+        fields.insert("asid".into(), json!(subject.asid));
+        if subject.terminal_addr != "0.0.0.0" {
+            fields.insert("terminal_addr".into(), json!(subject.terminal_addr));
+        }
+
+        let mut file_path: Option<String> = None;
+
+        match category {
+            "process" if op == "exec" => {
+                let exe = rec.paths.last().cloned().unwrap_or_default();
+                if rec.event == AUE_POSIX_SPAWN {
+                    // The subject of a posix_spawn record is the parent. The
+                    // new process id is in the "child PID" argument.
+                    if let Some(child) = rec.arg_named("child PID") {
+                        fields.insert("ppid".into(), json!(subject.pid));
+                        pid = child.value as u32;
+                    }
+                } else if let Some(parent) = self.parent_by_pid.get(&subject.pid) {
+                    fields.insert("ppid".into(), json!(parent));
                 }
-
-                // === NEW FILE-BASED DETECTORS ===
-
-                // Try persistence change detection from file ops
-                if let Some(evt) = crate::sensors::bsm::bsm_persistence_change::detect_persistence_change_from_file_op(
-                    host, stream_id, "", 0, path, op, pid, uid, euid, exe_path, base_event.ts_ms as u64
-                ) {
-                    derived.push(evt);
+                if let Some(parent_pid) = fields.get("ppid").and_then(|v| v.as_u64()) {
+                    if let Some(parent_exe) = self.exe_by_pid.get(&(parent_pid as u32)) {
+                        fields.insert("parent_exe".into(), json!(parent_exe));
+                    }
                 }
-
-                // Try defense evasion detection from file ops
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_defense_evasion::detect_defense_evasion_from_file_op(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        path,
-                        op,
-                        pid,
-                        uid,
-                        euid,
-                        exe_path,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
+                fields.insert("exe".into(), json!(exe));
+                fields.insert("argv".into(), json!(rec.exec_args));
+                fields.insert("cmdline".into(), json!(rec.exec_args.join(" ")));
+                if !rec.exec_env.is_empty() {
+                    fields.insert("env".into(), json!(rec.exec_env));
                 }
-
-                // === HIGH-VALUE COMPOSITE: Persistence with LaunchAgent + launchctl ===
-                let exe_base = std::path::Path::new(exe_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-
-                // Note: argv not available in dispatch_event context; would need BSM exec event augmentation
-                if exe_base.contains("launchctl") {
-                    if let Some(evt) = crate::sensors::bsm::bsm_composite_detectors::detect_persistence_with_launchctl_invocation(
-                        host, stream_id, path, op, pid, uid, exe_path, None, base_event.ts_ms as u64
-                    ) {
-                        derived.push(evt);
+                if let Some(id) = &rec.identity {
+                    fields.insert("signing_id".into(), json!(id.signing_id));
+                    fields.insert("team_id".into(), json!(id.team_id));
+                    fields.insert("signer_type".into(), json!(id.signer_type));
+                    fields.insert("cdhash".into(), json!(id.cdhash));
+                }
+                if rec.success() {
+                    let parent = fields.get("ppid").and_then(|v| v.as_u64()).map(|p| p as u32);
+                    self.remember(pid, Some(&exe), parent);
+                }
+                file_path = Some(exe);
+            }
+            "process" if op == "fork" => {
+                // fork returns the child pid to the parent.
+                if let Some(ret) = &rec.ret {
+                    if ret.error == 0 && ret.value > 0 {
+                        let child = ret.value as u32;
+                        fields.insert("child_pid".into(), json!(child));
+                        let parent_exe = self.exe_by_pid.get(&subject.pid).cloned();
+                        self.remember(child, parent_exe.as_deref(), Some(subject.pid));
                     }
                 }
             }
-        }
-    }
-
-    // Check for file delete/unlink operations
-    if base_event.tag_contains("file")
-        && (base_event.tag_contains("unlink") || base_event.tag_contains("delete"))
-    {
-        if let (Some(path_val), Some(pid_val), Some(uid_val)) = (
-            base_event.fields.get("path"),
-            base_event.fields.get("pid"),
-            base_event.fields.get("uid"),
-        ) {
-            if let (Some(path), Some(pid), Some(uid)) =
-                (path_val.as_str(), pid_val.as_u64(), uid_val.as_u64())
-            {
-                let pid = pid as u32;
-                let uid = uid as u32;
-                let euid = base_event
-                    .fields
-                    .get("euid")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(uid);
-
-                let exe_path = base_event
-                    .fields
-                    .get("exe")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-
-                // Try persistence change detection from delete
-                if let Some(evt) = crate::sensors::bsm::bsm_persistence_change::detect_persistence_change_from_file_op(
-                    host, stream_id, "", 0, path, "unlink", pid, uid, euid, exe_path, base_event.ts_ms as u64
-                ) {
-                    derived.push(evt);
+            "process" => {
+                // kill, ptrace and the task port calls name a target process.
+                let target = rec
+                    .process
+                    .as_ref()
+                    .map(|p| p.pid)
+                    .or_else(|| rec.arg_named("pid").map(|a| a.value as u32));
+                if let Some(target) = target {
+                    fields.insert("target_pid".into(), json!(target));
+                    if let Some(target_exe) = self.exe_by_pid.get(&target) {
+                        fields.insert("target_exe".into(), json!(target_exe));
+                    }
                 }
-
-                // Try defense evasion detection from delete (log/history deletion)
-                if let Some(evt) =
-                    crate::sensors::bsm::bsm_defense_evasion::detect_defense_evasion_from_file_op(
-                        host,
-                        stream_id,
-                        "",
-                        0,
-                        path,
-                        "unlink",
-                        pid,
-                        uid,
-                        euid,
-                        exe_path,
-                        base_event.ts_ms as u64,
-                    )
-                {
-                    derived.push(evt);
+                if let Some(signal) = rec.arg_named("signal") {
+                    fields.insert("signal".into(), json!(signal.value));
+                }
+                if op == "exit" {
+                    self.exe_by_pid.remove(&subject.pid);
+                    self.parent_by_pid.remove(&subject.pid);
                 }
             }
-        }
-    }
-
-    // Check for network connections to derive net_connect events
-    if base_event.tag_contains("network") && base_event.tag_contains("connect") {
-        if let (Some(ip_val), Some(port_val), Some(pid_val), Some(uid_val)) = (
-            base_event.fields.get("remote_ip"),
-            base_event.fields.get("remote_port"),
-            base_event.fields.get("pid"),
-            base_event.fields.get("uid"),
-        ) {
-            if let (Some(ip), Some(port), Some(pid), Some(uid)) = (
-                ip_val.as_str(),
-                port_val.as_u64(),
-                pid_val.as_u64(),
-                uid_val.as_u64(),
-            ) {
-                let pid = pid as u32;
-                let uid = uid as u32;
-                let euid = base_event
-                    .fields
-                    .get("euid")
-                    .and_then(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .unwrap_or(uid);
-
-                if let Some(evt) = crate::sensors::bsm::bsm_net_connect::detect_net_connect(
-                    host,
-                    stream_id,
-                    "",
-                    0,
-                    pid,
-                    uid,
-                    euid,
-                    ip,
-                    port as u16,
-                    base_event.ts_ms as u64,
-                ) {
-                    derived.push(evt);
+            "file" => {
+                let path = if op == "rename" {
+                    rec.paths.first().cloned()
+                } else {
+                    rec.paths.last().cloned()
+                };
+                let path = path?;
+                if op == "rename" && rec.paths.len() >= 2 {
+                    fields.insert("new_path".into(), json!(rec.paths[rec.paths.len() - 1]));
+                }
+                if let Some(variant) = open_variant(rec.event) {
+                    let access = match (variant.read, variant.write) {
+                        (true, true) => "rw",
+                        (false, true) => "w",
+                        _ => "r",
+                    };
+                    fields.insert("access".into(), json!(access));
+                    fields.insert("truncate".into(), json!(variant.truncate));
+                    if let Some(flags) = rec.arg_named("flags") {
+                        fields.insert("open_flags".into(), json!(flags.value));
+                    }
+                }
+                if op == "chmod" {
+                    if let Some(mode) = rec.arg_named("new file mode") {
+                        fields.insert("new_mode".into(), json!(format!("{:o}", mode.value)));
+                    }
+                }
+                if op == "chown" {
+                    if let Some(owner) = rec.arg_named("new file uid") {
+                        fields.insert("new_uid".into(), json!(owner.value));
+                    }
+                }
+                if let Some(attr) = rec.attrs.first() {
+                    fields.insert("inode".into(), json!(attr.node_id));
+                    fields.insert("file_mode".into(), json!(format!("{:o}", attr.mode)));
+                    fields.insert("file_uid".into(), json!(attr.uid));
+                }
+                fields.insert("path".into(), json!(path));
+                file_path = Some(path);
+            }
+            "privilege" => {
+                // The first argument is the id being set. setre* and setres*
+                // carry one argument per id.
+                let mut values: Vec<u64> = Vec::new();
+                for arg in &rec.args {
+                    values.push(arg.value);
+                }
+                if let Some(first) = values.first() {
+                    if op.contains("gid") || op == "setgroups" {
+                        fields.insert("target_gid".into(), json!(first));
+                    } else {
+                        fields.insert("target_uid".into(), json!(first));
+                    }
+                }
+                if values.len() > 1 {
+                    fields.insert("target_ids".into(), json!(values));
                 }
             }
+            "network" => {
+                if let Some(sock) = rec.sockets.last() {
+                    let (ip_key, port_key) = if op == "bind" {
+                        ("local_ip", "local_port")
+                    } else {
+                        ("remote_ip", "remote_port")
+                    };
+                    fields.insert("family".into(), json!(sock.family));
+                    if sock.family == "unix" {
+                        fields.insert("socket_path".into(), json!(sock.address));
+                    } else {
+                        fields.insert(ip_key.into(), json!(sock.address));
+                        fields.insert(port_key.into(), json!(sock.port));
+                    }
+                }
+                if let Some(fd) = rec.arg_named("fd") {
+                    fields.insert("fd".into(), json!(fd.value));
+                }
+            }
+            "fs" => {
+                if let Some(path) = rec.paths.last() {
+                    fields.insert("path".into(), json!(path));
+                }
+                if let Some(fs_type) = rec.texts.first() {
+                    fields.insert("fs_type".into(), json!(fs_type));
+                }
+            }
+            _ => {}
         }
-    }
 
-    derived
+        fields.insert("pid".into(), json!(pid));
+        if !fields.contains_key("exe") {
+            if let Some(exe) = self.exe_by_pid.get(&pid) {
+                fields.insert("exe".into(), json!(exe));
+            }
+        }
+
+        let identity_uid = if subject.auid != AU_DEFAUDITID { subject.auid } else { subject.ruid };
+        Some(Event {
+            ts_ms: rec.ts_ms as i64,
+            host: self.host.clone(),
+            tags: vec!["macos".to_string(), category.to_string(), op.to_string()],
+            proc_key: Some(hash_keys::proc_key(&self.host, pid, &self.stream_id)),
+            file_key: file_path
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .map(|p| hash_keys::file_key(&self.host, p, &self.stream_id)),
+            identity_key: Some(hash_keys::identity_key(&self.host, identity_uid, &self.stream_id)),
+            evidence_ptr: None,
+            fields,
+        })
+    }
 }
 
-impl Default for BSMReader {
-    fn default() -> Self {
-        Self::new()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classify_covers_the_playbook_inputs() {
+        assert_eq!(classify(AUE_EXECVE), Some(("process", "exec")));
+        assert_eq!(classify(AUE_POSIX_SPAWN), Some(("process", "exec")));
+        assert_eq!(classify(AUE_OPEN_R), Some(("file", "read")));
+        assert_eq!(classify(AUE_OPEN_W), Some(("file", "write")));
+        assert_eq!(classify(AUE_OPEN_RWTC), Some(("file", "create")));
+        assert_eq!(classify(AUE_OPENAT_R + 4), Some(("file", "write")));
+        assert_eq!(classify(AUE_UNLINKAT), Some(("file", "delete")));
+        assert_eq!(classify(AUE_RENAME), Some(("file", "rename")));
+        assert_eq!(classify(AUE_SETUID), Some(("privilege", "setuid")));
+        assert_eq!(classify(AUE_CONNECT), Some(("network", "connect")));
+        assert_eq!(classify(AUE_LISTEN), Some(("network", "listen")));
+        assert_eq!(classify(AUE_MOUNT), Some(("fs", "mount")));
+        assert_eq!(classify(AUE_TASKFORPID), Some(("process", "task_for_pid")));
+        assert_eq!(classify(AUE_AUDITCTL), Some(("audit_config", "auditctl")));
+        // Old wrong numbers must not be treated as exec or open.
+        assert_eq!(classify(59), None);
+        assert_eq!(classify(5), Some(("file", "link"))); // 5 is AUE_LINK
     }
 }

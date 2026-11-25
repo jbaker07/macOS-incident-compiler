@@ -1,11 +1,6 @@
-/// macOS sensor modules
-///
-/// Contains sensor extraction implementations that convert platform events to canonical Events:
-/// - bsm/: OpenBSM audit log → Events
-/// - es/: Endpoint Security events → Events
+//! Sensor code for the macOS capture agent.
+//!
+//! - `bsm`: OpenBSM audit records from /dev/auditpipe or a trail file
+//! - `hash_keys`: stable process, file and identity keys
 pub mod bsm;
-pub mod es;
 pub mod hash_keys;
-
-#[cfg(test)]
-mod wiring_tests;
