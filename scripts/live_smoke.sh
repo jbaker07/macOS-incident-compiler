@@ -196,8 +196,23 @@ echo "Detections stored: $(sqlite3 "$SMOKE_TELEMETRY_ROOT/workbench.db" "SELECT 
 if [ $FAILED_CHECKS -ne 0 ]; then
     #Show what the capture recorded for the trigger files, so a miss can be told apart
     #from a record the audit pipe dropped.
-    echo "Captured events that name a trigger file (first 20):"
-    grep -h -E 'LaunchAgents|/work/curl|zsh_history|id_edrsmoke' "$SMOKE_TELEMETRY_ROOT"/segments/*.jsonl 2>/dev/null | head -20 | cut -c1-600
+    for TRIGGER_FILE in LaunchAgents agent.plist /work/curl zsh_history id_edrsmoke; do
+        echo "Captured events that name $TRIGGER_FILE (first 5):"
+        cat "$SMOKE_TELEMETRY_ROOT"/segments/*.jsonl 2>/dev/null | python3 -c '
+import json, sys
+shown = 0
+for line in sys.stdin:
+    if sys.argv[1] not in line:
+        continue
+    f = json.loads(line).get("fields", {})
+    print("  ", f.get("aue_name"), f.get("op"), f.get("path"), f.get("new_path", ""), f.get("exe"), "success", f.get("success"))
+    shown += 1
+    if shown == 5:
+        break
+if shown == 0:
+    print("   none")
+' "$TRIGGER_FILE"
+    done
     echo "$FAILED_CHECKS checks failed. Output is in $SMOKE_OUTPUT_FOLDER"
     exit 1
 fi
