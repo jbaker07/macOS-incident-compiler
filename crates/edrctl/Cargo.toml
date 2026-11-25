@@ -2,7 +2,7 @@
 name = "edrctl"
 version = "0.1.0"
 edition = "2021"
-description = "EDR stack orchestrator - one command to rule them all"
+description = "Starts, stops and checks the macOS incident compiler stack"
 
 [[bin]]
 name = "edrctl"
@@ -12,10 +12,7 @@ path = "src/main.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.11", features = ["blocking"] }
+reqwest = { version = "0.11", features = ["blocking", "json"] }
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
 dirs = "5"
-
-[target.'cfg(unix)'.dependencies]
 libc = "0.2"

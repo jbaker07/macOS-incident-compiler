@@ -1,203 +1,156 @@
-//! EDR Server Library
+//! edr-server: a small read only HTTP API over the detections in workbench.db,
+//! plus the detections page.
 //!
-//! Exposes report generation and test utilities for in-process testing.
-//! Ship Hardening: Includes health checks, path safety, and write isolation.
+//! Routes:
+//!
+//! - `GET /` redirects to `/ui/index.html`
+//! - `GET /ui/index.html` the detections page (compiled into the binary)
+//! - `GET /api` a short list of these endpoints
+//! - `GET /health`, `GET /api/health`
+//! - `GET /api/signals?host=&signal_type=&severity=&limit=`
+//! - `GET /api/signals/stats`
+//! - `GET /api/signals/:id`
+//! - `GET /api/signals/:id/explain`
 
-pub mod bundle_exchange;
-pub mod golden_bundle;
-pub mod health;
-pub mod integration_api;
-pub mod query_isolation;
-pub mod report;
-pub mod support_bundle;
-pub mod write_isolation;
+pub mod db;
 
-// Re-export key types for tests
-pub use report::{
-    ClaimEntry, DisambiguatorEntry, HypothesisSummary, IntegrityNoteEntry, PdfRenderer,
-    ReportBundle, ReportBundleBuilder, ReportRequest, TimelineEntry, VisibilitySection,
-};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Redirect, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use db::Database;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-pub use golden_bundle::{
-    generate_all_golden_bundles, generate_golden_bundle, get_predefined_scenarios,
-    verify_all_bundles, verify_bundle_in_process, BundleVerifyResult, GoldenFeatures,
-    GoldenScenario, Verdict, VerificationReport, VerifyMode,
-};
+/// The detections page, compiled in so the binary works from any folder.
+pub const INDEX_HTML: &str = include_str!("../../../ui/index.html");
 
-// Ship Hardening: Health and isolation types
-pub use health::{
-    check_health, validate_startup, BlockingIssue, BuildInfo, CaptureStatus, HealthCheckConfig,
-    HealthResponse, HealthVerdict, ImportedStatus, StartupValidation, StorageHealth, StreamHealth,
-};
+const API_PAGE: &str = r#"<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Incident Compiler API</title>
+<style>body{font-family:-apple-system,sans-serif;max-width:800px;margin:40px auto;padding:0 16px}code{background:#eee;padding:2px 6px;border-radius:3px}li{margin:6px 0}</style>
+</head>
+<body>
+<h1>Incident Compiler API</h1>
+<p><a href="/ui/index.html">Open the detections page</a></p>
+<ul>
+<li>GET <code>/api/health</code> service status and version</li>
+<li>GET <code>/api/signals</code> detections stored by edr-locald (query: host, signal_type, severity, limit)</li>
+<li>GET <code>/api/signals/stats</code> counts by severity, host and playbook</li>
+<li>GET <code>/api/signals/:id</code> one detection</li>
+<li>GET <code>/api/signals/:id/explain</code> playbook slots, evidence pointers and the audit events behind them</li>
+</ul>
+</body>
+</html>"#;
 
-pub use write_isolation::{
-    extract_bundle_id_from_path, is_imported_path, WriteIsolationContext, WriteIsolationError,
-};
-
-pub use query_isolation::{
-    extract_bundle_id, is_imported_namespace, make_imported_namespace, IsolatedQueryResult,
-    NamespaceFilter, QuerySource,
-};
-
-// Integration Profile API
-pub use integration_api::{
-    integration_api_router, CapabilitiesMatrixApi, CapabilitySource, CollectorInfo,
-    DerivedScopeKey, Fidelity, HealthStatus, IntegrationApiState, IntegrationDetailApi,
-    IntegrationMode, IntegrationProfileApi, JoinKeySupport, MappedEventSample,
-    SampleEventsResponse, SourceType,
-};
-
-/// Build a minimal router for testing the PDF report endpoint.
-/// This does not require database or full app state.
-#[cfg(any(test, feature = "test-utils"))]
-pub fn build_test_router() -> axum::Router {
-    use axum::{routing::post, Router};
-
-    Router::new().route("/api/report/pdf", post(generate_pdf_report_handler))
+#[derive(Serialize)]
+struct ApiResponse<T> {
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
-/// Standalone PDF report handler for testing
-/// Does not require SharedState - uses the request data directly
-#[cfg(any(test, feature = "test-utils"))]
-async fn generate_pdf_report_handler(
-    axum::extract::Json(req): axum::extract::Json<ReportRequest>,
-) -> impl axum::response::IntoResponse {
-    use axum::http::{header, StatusCode};
-    use axum::response::IntoResponse;
-    use axum::Json;
+fn ok<T: Serialize>(data: T) -> Response {
+    Json(ApiResponse {
+        success: true,
+        data: Some(data),
+        error: None,
+    })
+    .into_response()
+}
 
-    // Build the report bundle from the request
-    let report_id = uuid::Uuid::new_v4().to_string();
-    let host_id = "test-host-001".to_string();
+fn err(status: StatusCode, message: String) -> Response {
+    (
+        status,
+        Json(ApiResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(message),
+        }),
+    )
+        .into_response()
+}
 
-    let bundle = build_test_bundle(&req, report_id, host_id);
+fn db_error(e: rusqlite::Error) -> Response {
+    err(StatusCode::INTERNAL_SERVER_ERROR, format!("database error: {}", e))
+}
 
-    // Render to PDF
-    let renderer = match PdfRenderer::new() {
-        Ok(r) => r,
-        Err(_) => PdfRenderer::default(),
-    };
+#[derive(Deserialize)]
+struct SignalQuery {
+    host: Option<String>,
+    signal_type: Option<String>,
+    severity: Option<String>,
+    limit: Option<usize>,
+}
 
-    match renderer.render(&bundle) {
-        Ok(pdf_bytes) => {
-            let incident = bundle.metadata.incident_id.as_deref().unwrap_or("unknown");
-            let filename = format!(
-                "edr_report_{}_{}.pdf",
-                incident,
-                chrono::Utc::now().format("%Y%m%d_%H%M%S")
-            );
-            let content_disposition = format!("attachment; filename=\"{}\"", filename);
+async fn health(State(db): State<Arc<Database>>) -> Response {
+    let database = if db.health_check().is_ok() { "ok" } else { "error" };
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "edr-server",
+        "version": env!("CARGO_PKG_VERSION"),
+        "database": database,
+    }))
+    .into_response()
+}
 
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, "application/pdf"),
-                    (header::CONTENT_DISPOSITION, content_disposition.as_str()),
-                ],
-                pdf_bytes,
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "error": format!("PDF generation failed: {}", e)
-            })),
-        )
-            .into_response(),
+async fn list_signals(State(db): State<Arc<Database>>, Query(q): Query<SignalQuery>) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
+    match db.list_signals(q.host.as_deref(), q.signal_type.as_deref(), q.severity.as_deref(), limit) {
+        Ok(signals) => ok(signals),
+        Err(e) => db_error(e),
     }
 }
 
-/// Build a deterministic test bundle with required fixture data:
-/// - 1 hypothesis
-/// - 2 timeline entries (one is_late_arrival=true)
-/// - 1 claim with evidence pointer
-/// - visibility_state with missing stream
-/// - 1 disambiguator
-#[cfg(any(test, feature = "test-utils"))]
-pub fn build_test_bundle(req: &ReportRequest, report_id: String, host_id: String) -> ReportBundle {
-    use chrono::{TimeZone, Utc};
+async fn signal_stats(State(db): State<Arc<Database>>) -> Response {
+    match db.signal_stats() {
+        Ok(stats) => ok(stats),
+        Err(e) => db_error(e),
+    }
+}
 
-    // Use fixed timestamps for deterministic output
-    let base_ts = Utc.with_ymd_and_hms(2025, 12, 27, 10, 0, 0).unwrap();
-    let late_ts = Utc.with_ymd_and_hms(2025, 12, 27, 10, 5, 30).unwrap();
+async fn get_signal(State(db): State<Arc<Database>>, Path(id): Path<String>) -> Response {
+    match db.get_signal(&id) {
+        Ok(Some(signal)) => ok(signal),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("signal '{}' not found", id)),
+        Err(e) => db_error(e),
+    }
+}
 
-    ReportBundleBuilder::new(report_id, host_id)
-        .with_incident_id(
-            req.incident_id
-                .clone()
-                .unwrap_or_else(|| "test-incident-fixture".to_string()),
-        )
-        .with_session_id(
-            req.session_id
-                .clone()
-                .unwrap_or_else(|| "test-session-fixture".to_string()),
-        )
-        .with_family("credential_access".to_string())
-        .with_summary(
-            "Test fixture: Credential theft detection with LSASS access pattern.".to_string(),
-        )
-        // 1 hypothesis (required by fixture spec)
-        .add_hypothesis(HypothesisSummary {
-            rank: 1,
-            hypothesis_id: "H-TEST-001".to_string(),
-            family: "credential_access".to_string(),
-            template_id: "T1003.001".to_string(),
-            confidence: 0.92,
-            severity: "High".to_string(),
-            suppressed: false,
-            suppression_reason: None,
-            slots_satisfied: "4/5 slots filled".to_string(),
-        })
-        // 2 timeline entries (one with is_late_arrival=true)
-        .add_timeline_entry(TimelineEntry {
-            ts: base_ts,
-            summary: "Initial LSASS memory access detected".to_string(),
-            category: "process".to_string(),
-            evidence_ptr: Some("seg_001:evt_0".to_string()),
-            is_late_arrival: false,
-        })
-        .add_timeline_entry(TimelineEntry {
-            ts: late_ts,
-            summary: "Secondary credential dump attempt (late arrival)".to_string(),
-            category: "process".to_string(),
-            evidence_ptr: Some("seg_002:evt_0".to_string()),
-            is_late_arrival: true, // Required by fixture spec
-        })
-        // 1 claim with evidence pointer
-        .add_claim(ClaimEntry {
-            claim_id: "C-TEST-001".to_string(),
-            text: "LSASS process memory was accessed by mimikatz.exe".to_string(),
-            certainty: "observed".to_string(),
-            claim_type: "MemoryAccess".to_string(),
-            evidence_ptrs: vec!["seg_001:evt_0".to_string()], // Evidence pointer required
-            has_conflict: false,
-        })
-        // Visibility with missing stream
-        .with_visibility(VisibilitySection {
-            overall_health: "degraded".to_string(),
-            streams_present: vec!["process_events".to_string(), "file_events".to_string()],
-            streams_missing: vec!["network_events".to_string()], // Missing stream required
-            degraded: true,
-            degraded_reasons: vec!["Network sensor offline".to_string()],
-            late_arrival_count: 1,
-            watermark_notes: vec!["Fixture test watermark".to_string()],
-        })
-        // 1 disambiguator
-        .add_disambiguator(DisambiguatorEntry {
-            id: "D-TEST-001".to_string(),
-            priority: 1,
-            question: "Is the LSASS access from a known security tool?".to_string(),
-            pivot_action: "Check process hash against allowlist".to_string(),
-            if_yes: "Benign - update allowlist documentation".to_string(),
-            if_no: "Malicious - escalate to IR team".to_string(),
-            actionable: true,
-        })
-        // Add evidence excerpt for the claim
-        .add_evidence_excerpt(
-            "seg_001:evt_0".to_string(),
-            "Process: mimikatz.exe (PID: 1234) -> OpenProcess(PROCESS_VM_READ) on lsass.exe"
-                .to_string(),
-        )
-        .build()
+async fn explain_signal(State(db): State<Arc<Database>>, Path(id): Path<String>) -> Response {
+    match db.get_signal(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(StatusCode::NOT_FOUND, format!("signal '{}' not found", id)),
+        Err(e) => return db_error(e),
+    }
+    match db.get_signal_explanation(&id) {
+        Ok(Some(explanation)) => ok(explanation),
+        Ok(None) => err(StatusCode::NOT_FOUND, format!("no explanation stored for '{}'", id)),
+        Err(e) => db_error(e),
+    }
+}
+
+async fn index_page() -> impl IntoResponse {
+    Html(INDEX_HTML)
+}
+
+/// Build the router. Used by main.rs and by the tests.
+pub fn router(db: Arc<Database>) -> Router {
+    // No CORS layer: the page is served from this origin, and without CORS
+    // headers a browser will not let any other site read these responses.
+    Router::new()
+        .route("/", get(|| async { Redirect::temporary("/ui/index.html") }))
+        .route("/ui", get(|| async { Redirect::temporary("/ui/index.html") }))
+        .route("/ui/index.html", get(index_page))
+        .route("/api", get(|| async { Html(API_PAGE) }))
+        .route("/health", get(health))
+        .route("/api/health", get(health))
+        .route("/api/signals", get(list_signals))
+        .route("/api/signals/stats", get(signal_stats))
+        .route("/api/signals/:id", get(get_signal))
+        .route("/api/signals/:id/explain", get(explain_signal))
+        .with_state(db)
 }
