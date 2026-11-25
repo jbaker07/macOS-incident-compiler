@@ -2,13 +2,12 @@
 name = "edr-core"
 version = "0.1.0"
 edition = "2021"
-description = "Shared types and schemas for the attack documentation workbench"
+description = "Event and evidence pointer types shared by the capture agent and edr-locald"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
 sha2 = "0.10"
