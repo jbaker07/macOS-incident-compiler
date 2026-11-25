@@ -43,7 +43,10 @@ jobs:
           "$RUNNER_TEMP/make_bsm_fixtures" "$RUNNER_TEMP/fixtures"
           cmp "$RUNNER_TEMP/fixtures/attack_chain.bsm" tests/fixtures/bsm/attack_chain.bsm
           cmp "$RUNNER_TEMP/fixtures/benign_session.bsm" tests/fixtures/bsm/benign_session.bsm
-          praudit -l -n tests/fixtures/bsm/benign_session.bsm
+          #praudit exits 1 at the end of a trail even after printing every record, so count the records instead
+          praudit -l -n tests/fixtures/bsm/benign_session.bsm > "$RUNNER_TEMP/benign_session.txt" || true
+          cat "$RUNNER_TEMP/benign_session.txt"
+          test "$(grep -c '^header' "$RUNNER_TEMP/benign_session.txt")" -eq 8
 
       - name: Replay demo
         run: scripts/replay_demo.sh "$RUNNER_TEMP/replay"
@@ -78,12 +81,14 @@ jobs:
 
       - name: Live capture, or replay if auditing cannot start
         run: |
+          #The output goes under /private/tmp because two of the playbooks watch for a program
+          #run from a world writable folder, and the runner's temp folder is not one.
           set +e
-          sudo scripts/live_smoke.sh "$RUNNER_TEMP/live"
+          sudo scripts/live_smoke.sh /private/tmp/edr-live
           LIVE_STATUS=$?
           set -e
-          if [ -f "$RUNNER_TEMP/live/summary.md" ]; then
-            cat "$RUNNER_TEMP/live/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f /private/tmp/edr-live/summary.md ]; then
+            cat /private/tmp/edr-live/summary.md >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ "$LIVE_STATUS" -eq 3 ]; then
             echo "::warning::BSM auditing could not be started on this runner without a reboot, so live capture was not tested. Running the same checks on the recorded trail."

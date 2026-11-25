@@ -164,7 +164,9 @@ HEARTBEAT_FILE="$SMOKE_TELEMETRY_ROOT/capture_heartbeat.json"
 RECORDS_READ=$(grep -o '"records_read": [0-9]*' "$HEARTBEAT_FILE" | grep -o '[0-9]*$')
 DECODE_ERRORS=$(grep -o '"decode_errors": [0-9]*' "$HEARTBEAT_FILE" | grep -o '[0-9]*$')
 UNKNOWN_TOKEN_RECORDS=$(grep -o '"records_with_unknown_token": [0-9]*' "$HEARTBEAT_FILE" | grep -o '[0-9]*$')
-echo "Records read: ${RECORDS_READ:-0}, decode errors: ${DECODE_ERRORS:-0}, records with an unknown token: ${UNKNOWN_TOKEN_RECORDS:-0}" | tee -a "$SUMMARY_FILE"
+#Records the kernel dropped because the audit pipe queue was full. null in replay mode or if the ioctl failed.
+PIPE_DROPS=$(grep -o '"pipe_drops": [0-9a-z]*' "$HEARTBEAT_FILE" | grep -o '[0-9a-z]*$')
+echo "Records read: ${RECORDS_READ:-0}, decode errors: ${DECODE_ERRORS:-0}, records with an unknown token: ${UNKNOWN_TOKEN_RECORDS:-0}, dropped by the audit pipe: ${PIPE_DROPS:-unknown}" | tee -a "$SUMMARY_FILE"
 
 FAILED_CHECKS=0
 if [ "${RECORDS_READ:-0}" -eq 0 ]; then
@@ -192,6 +194,10 @@ done
 
 echo "Detections stored: $(sqlite3 "$SMOKE_TELEMETRY_ROOT/workbench.db" "SELECT COUNT(*) FROM signals")"
 if [ $FAILED_CHECKS -ne 0 ]; then
+    #Show what the capture recorded for the trigger files, so a miss can be told apart
+    #from a record the audit pipe dropped.
+    echo "Captured events that name a trigger file (first 20):"
+    grep -h -E 'LaunchAgents|/work/curl|zsh_history|id_edrsmoke' "$SMOKE_TELEMETRY_ROOT"/segments/*.jsonl 2>/dev/null | head -20 | cut -c1-600
     echo "$FAILED_CHECKS checks failed. Output is in $SMOKE_OUTPUT_FOLDER"
     exit 1
 fi
