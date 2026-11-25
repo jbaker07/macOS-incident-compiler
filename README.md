@@ -35,7 +35,7 @@ On macOS 27.2 (Apple silicon) with Rust 1.100.0:
 - `scripts/live_smoke.sh --replay` runs the live smoke test's checks on the recorded trail and passes.
 - `edrctl up --no-capture`, `edrctl status` and `edrctl down` were run, and the detections page was opened in a browser.
 
-Not checked on this Mac: live capture from the kernel and `sudo edrctl up`, because both need root. The `live-capture` CI job runs `scripts/live_smoke.sh` with sudo on a GitHub macOS runner (see [Live capture](#live-capture)). It has not run yet, because nothing has been pushed.
+Not checked on this Mac: live capture from the kernel and `sudo edrctl up`, because both need root. The `live-capture` CI job runs `scripts/live_smoke.sh` with sudo on a GitHub macOS runner (see [Live capture](#live-capture)). On November 24, 2026 it turned auditing on without a reboot and passed: 131,493 records read, 0 decode errors, and all eight playbooks fired from live records.
 
 ## Quick start without root
 
@@ -153,7 +153,9 @@ How facts are grouped: every fact is keyed to the audit session of the process b
 
 ## Limits
 
-- Live capture has not been seen working yet. The smoke test and the CI job are written for it.
+- Live capture loses records under a burst. When the audit pipe's queue is full (1,024 records, the maximum the pipe reports), the kernel drops records: 10,709 in the passing CI run, about 7 percent. A dropped record is a missed event, so a detection can miss. The smoke test prints the count.
+- edr-locald is slow on a large capture: it took about 4 minutes to process the 32,098 events of that CI run.
+- BSM records the path a program passed. A relative path is joined to the process's working folder, which the reader learns from chdir, fchdir, fork and posix_spawn records. A process that changed folder before capture started keeps the relative path, marked `path_relative`.
 - The test trails are written with libbsm in the token order XNU uses. They were not recorded from a live kernel.
 - libbsm on macOS 27.2 writes the two bytes of an IPv6 port swapped (`au_to_sock_inet128` converts a port that is already in network order a second time), so `praudit` shows port 8443 as 64288. The parser swaps them back. XNU's token code also comes from OpenBSM, but this has not been checked on a live record.
 - BSM does not audit `setxattr` or `removexattr`, so stripping the quarantine attribute is only visible as the `xattr` command. Exec environment variables, and so `DYLD_INSERT_LIBRARIES`, are only recorded when the audit policy includes `arge`.
