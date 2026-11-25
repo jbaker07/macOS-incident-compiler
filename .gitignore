@@ -1,5 +1,6 @@
 # build + runtime
 target/
+src-tauri/gen/schemas/
 logs/
 state/
 json_files/
@@ -13,6 +14,7 @@ run_output.txt
 edr-digest-*.txt
 
 # telemetry outputs (runtime data)
+telemetry_output/
 telemetry_output_demo/
 test_telemetry/
 segments/
