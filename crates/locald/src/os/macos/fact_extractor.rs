@@ -50,10 +50,13 @@ pub fn scope_for(event: &Event) -> ScopeKey {
 
 /// What kind of persistence a path is, if it is one.
 pub fn persistence_type(path: &str) -> Option<PersistenceType> {
-    if path.ends_with(".plist") && path.contains("/Library/LaunchAgents/") {
+    // A relative path the capture could not join to a folder still counts, since
+    // "cp x Library/LaunchAgents/y.plist" from a home folder is the usual way in.
+    let under = |folder: &str| path.contains(&format!("/{}/", folder)) || path.starts_with(&format!("{}/", folder));
+    if path.ends_with(".plist") && under("Library/LaunchAgents") {
         return Some(PersistenceType::LaunchAgent);
     }
-    if path.ends_with(".plist") && path.contains("/Library/LaunchDaemons/") {
+    if path.ends_with(".plist") && under("Library/LaunchDaemons") {
         return Some(PersistenceType::LaunchDaemon);
     }
     if path.starts_with("/usr/lib/cron/tabs/")

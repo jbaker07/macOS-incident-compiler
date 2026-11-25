@@ -95,6 +95,10 @@ pub struct Normalizer {
     stream_id: String,
     exe_by_pid: HashMap<u32, String>,
     parent_by_pid: HashMap<u32, u32>,
+    /// Working directory per pid, from chdir and fchdir records and inherited on fork
+    /// and posix_spawn. The kernel records the path a program passed, so a file created
+    /// with a relative path (cp x Library/LaunchAgents/y.plist) has no folder in front.
+    cwd_by_pid: HashMap<u32, String>,
     insertion_order: VecDeque<u32>,
 }
 
@@ -105,6 +109,7 @@ impl Normalizer {
             stream_id: stream_id.to_string(),
             exe_by_pid: HashMap::new(),
             parent_by_pid: HashMap::new(),
+            cwd_by_pid: HashMap::new(),
             insertion_order: VecDeque::new(),
         }
     }
@@ -123,13 +128,54 @@ impl Normalizer {
             if let Some(old) = self.insertion_order.pop_front() {
                 self.exe_by_pid.remove(&old);
                 self.parent_by_pid.remove(&old);
+                self.cwd_by_pid.remove(&old);
             }
         }
+    }
+
+    /// The child starts in its parent's working directory.
+    fn inherit_cwd(&mut self, parent: u32, child: u32) {
+        if let Some(cwd) = self.cwd_by_pid.get(&parent).cloned() {
+            self.cwd_by_pid.insert(child, cwd);
+        }
+    }
+
+    /// An absolute path for `path`, joined to the pid's working directory when the
+    /// program passed a relative one. None when it is relative and the folder is not
+    /// known, because the process changed folder before the capture started.
+    fn absolute(&self, pid: u32, path: &str) -> Option<String> {
+        if path.starts_with('/') {
+            return Some(path.to_string());
+        }
+        let cwd = self.cwd_by_pid.get(&pid)?;
+        let mut parts: Vec<&str> = cwd.split('/').filter(|p| !p.is_empty()).collect();
+        for part in path.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
+            }
+        }
+        Some(format!("/{}", parts.join("/")))
     }
 
     /// Normalize one record. Returns None for event numbers the agent does
     /// not handle and for records without a subject token.
     pub fn normalize(&mut self, rec: &BsmRecord) -> Option<Event> {
+        if rec.event == AUE_CHDIR || rec.event == AUE_FCHDIR {
+            // Kept as state for relative paths, not written out as an event.
+            let subject = rec.subject.as_ref()?;
+            if rec.success() {
+                if let Some(dir) = rec.paths.last() {
+                    if let Some(dir) = self.absolute(subject.pid, dir) {
+                        self.cwd_by_pid.insert(subject.pid, dir);
+                    }
+                }
+            }
+            return None;
+        }
         let (category, op) = classify(rec.event)?;
         let subject = rec.subject.as_ref()?;
 
@@ -173,6 +219,7 @@ impl Normalizer {
                     if let Some(child) = rec.arg_named("child PID") {
                         fields.insert("ppid".into(), json!(subject.pid));
                         pid = child.value as u32;
+                        self.inherit_cwd(subject.pid, pid);
                     }
                 } else if let Some(parent) = self.parent_by_pid.get(&subject.pid) {
                     fields.insert("ppid".into(), json!(parent));
@@ -208,6 +255,7 @@ impl Normalizer {
                         fields.insert("child_pid".into(), json!(child));
                         let parent_exe = self.exe_by_pid.get(&subject.pid).cloned();
                         self.remember(child, parent_exe.as_deref(), Some(subject.pid));
+                        self.inherit_cwd(subject.pid, child);
                     }
                 }
             }
@@ -230,6 +278,7 @@ impl Normalizer {
                 if op == "exit" {
                     self.exe_by_pid.remove(&subject.pid);
                     self.parent_by_pid.remove(&subject.pid);
+                    self.cwd_by_pid.remove(&subject.pid);
                 }
             }
             "file" => {
@@ -238,9 +287,21 @@ impl Normalizer {
                 } else {
                     rec.paths.last().cloned()
                 };
-                let path = path?;
+                let given = path?;
+                let path = match self.absolute(subject.pid, &given) {
+                    Some(full) => full,
+                    None => {
+                        fields.insert("path_relative".into(), json!(true));
+                        given.clone()
+                    }
+                };
+                if path != given {
+                    fields.insert("path_given".into(), json!(given));
+                }
                 if op == "rename" && rec.paths.len() >= 2 {
-                    fields.insert("new_path".into(), json!(rec.paths[rec.paths.len() - 1]));
+                    let new_given = &rec.paths[rec.paths.len() - 1];
+                    let new_path = self.absolute(subject.pid, new_given).unwrap_or_else(|| new_given.clone());
+                    fields.insert("new_path".into(), json!(new_path));
                 }
                 if let Some(variant) = open_variant(rec.event) {
                     let access = match (variant.read, variant.write) {
@@ -346,6 +407,7 @@ impl Normalizer {
 
 #[cfg(test)]
 mod tests {
+    use super::super::record::{Arg, ReturnInfo, Subject};
     use super::*;
 
     #[test]
@@ -367,5 +429,69 @@ mod tests {
         // Old wrong numbers must not be treated as exec or open.
         assert_eq!(classify(59), None);
         assert_eq!(classify(5), Some(("file", "link"))); // 5 is AUE_LINK
+    }
+
+    fn record(event: u16, pid: u32, paths: &[&str], ret_value: u64) -> BsmRecord {
+        BsmRecord {
+            event,
+            subject: Some(Subject {
+                auid: 501,
+                euid: 0,
+                egid: 0,
+                ruid: 0,
+                rgid: 0,
+                pid,
+                asid: 100002,
+                terminal_addr: "0.0.0.0".to_string(),
+            }),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+            ret: Some(ReturnInfo { error: 0, value: ret_value }),
+            ..Default::default()
+        }
+    }
+
+    fn path_of(event: &Event) -> &str {
+        event.fields.get("path").and_then(|v| v.as_str()).unwrap_or("")
+    }
+
+    #[test]
+    fn relative_paths_are_joined_to_the_working_folder() {
+        // The live run on a GitHub macOS runner: the shell cds into the work folder,
+        // forks cp, and cp creates Library/LaunchAgents/edr.smoke.plist by a relative path.
+        let mut n = Normalizer::new("host", "bsm");
+        assert!(n.normalize(&record(AUE_CHDIR, 100, &["/private/tmp/edr-live/work"], 0)).is_none());
+        n.normalize(&record(AUE_FORK, 100, &[], 200)).unwrap();
+        let create = n.normalize(&record(AUE_OPENAT_R + 11, 200, &["Library/LaunchAgents/edr.smoke.plist"], 3)).unwrap();
+        assert_eq!(path_of(&create), "/private/tmp/edr-live/work/Library/LaunchAgents/edr.smoke.plist");
+        assert_eq!(create.fields.get("path_given").and_then(|v| v.as_str()), Some("Library/LaunchAgents/edr.smoke.plist"));
+
+        // ./ and ../ are applied, and an absolute path is left alone.
+        let up = n.normalize(&record(AUE_OPEN_R, 200, &["../other/./notes.txt"], 3)).unwrap();
+        assert_eq!(path_of(&up), "/private/tmp/edr-live/other/notes.txt");
+        let abs = n.normalize(&record(AUE_OPEN_R, 200, &["/etc/hosts"], 3)).unwrap();
+        assert_eq!(path_of(&abs), "/etc/hosts");
+        assert!(abs.fields.get("path_given").is_none());
+    }
+
+    #[test]
+    fn an_unknown_working_folder_keeps_the_path_and_says_so() {
+        let mut n = Normalizer::new("host", "bsm");
+        let create = n.normalize(&record(AUE_OPEN_RWTC, 300, &["Library/LaunchAgents/x.plist"], 3)).unwrap();
+        assert_eq!(path_of(&create), "Library/LaunchAgents/x.plist");
+        assert_eq!(create.fields.get("path_relative").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn posix_spawn_children_inherit_the_folder_and_exit_forgets_it() {
+        let mut n = Normalizer::new("host", "bsm");
+        n.normalize(&record(AUE_CHDIR, 10, &["/Users/alice"], 0));
+        let mut spawn = record(AUE_POSIX_SPAWN, 10, &["/bin/cp"], 0);
+        spawn.args = vec![Arg { number: 0, value: 11, name: "child PID".to_string() }];
+        n.normalize(&spawn).unwrap();
+        let create = n.normalize(&record(AUE_OPEN_RWTC, 11, &["Library/LaunchAgents/y.plist"], 3)).unwrap();
+        assert_eq!(path_of(&create), "/Users/alice/Library/LaunchAgents/y.plist");
+        n.normalize(&record(AUE_EXIT, 11, &[], 0)).unwrap();
+        let after = n.normalize(&record(AUE_OPEN_R, 11, &["z.txt"], 3)).unwrap();
+        assert_eq!(path_of(&after), "z.txt");
     }
 }

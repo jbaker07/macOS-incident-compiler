@@ -14,7 +14,7 @@ slots:
     ttl_seconds: 600
     predicate:
       fact_type: PersistArtifact
-      path_regex: '/Library/Launch(Agents|Daemons)/[^/]+\.plist$'
+      path_regex: '(^|/)Library/Launch(Agents|Daemons)/[^/]+\.plist$'
   - slot_id: launchctl_load
     name: launchctl load, bootstrap, enable or kickstart
     required: true

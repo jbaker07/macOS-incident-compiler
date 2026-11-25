@@ -14,4 +14,4 @@ slots:
     ttl_seconds: 600
     predicate:
       fact_type: PersistArtifact
-      path_regex: '/Library/LaunchAgents/[^/]+\.plist$'
+      path_regex: '(^|/)Library/LaunchAgents/[^/]+\.plist$'

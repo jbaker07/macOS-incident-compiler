@@ -63,6 +63,8 @@ pub const AUE_OPENBYID_RWT: u16 = 43209;
 
 // Delete, rename, links
 pub const AUE_UNLINK: u16 = 6;
+pub const AUE_CHDIR: u16 = 8;
+pub const AUE_FCHDIR: u16 = 68;
 pub const AUE_UNLINKAT: u16 = 286;
 pub const AUE_RMDIR: u16 = 48;
 pub const AUE_RENAME: u16 = 42;
@@ -129,6 +131,8 @@ pub const KNOWN_EVENTS: &[(&str, u16)] = &[
     ("AUE_FORK", AUE_FORK),
     ("AUE_VFORK", AUE_VFORK),
     ("AUE_EXIT", AUE_EXIT),
+    ("AUE_CHDIR", AUE_CHDIR),
+    ("AUE_FCHDIR", AUE_FCHDIR),
     ("AUE_KILL", AUE_KILL),
     ("AUE_PTRACE", AUE_PTRACE),
     ("AUE_TASKFORPID", AUE_TASKFORPID),
