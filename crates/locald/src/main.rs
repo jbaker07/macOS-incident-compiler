@@ -109,6 +109,12 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn open_db(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
+    // Write-ahead logging: each detection was its own transaction with a rollback
+    // journal created, synced and deleted, which dominated a large run. WAL with
+    // synchronous=NORMAL never corrupts the file, and a crash replays at most the
+    // segment after the last checkpoint, which INSERT OR REPLACE absorbs.
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS signals (
             signal_id TEXT PRIMARY KEY,

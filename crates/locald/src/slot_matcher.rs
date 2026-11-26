@@ -17,6 +17,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Mutex, OnceLock};
+
+/// Playbook patterns compiled once. Compiling a regex for every fact and slot was most
+/// of edr-locald's time on a live capture. An invalid pattern is cached as None.
+fn cached_regex(pattern: &str) -> Option<regex::Regex> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<regex::Regex>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.entry(pattern.to_string())
+        .or_insert_with(|| regex::Regex::new(pattern).ok())
+        .clone()
+}
 
 // ============================================================================
 // Capability Model
@@ -474,7 +486,7 @@ impl SlotMatcher {
         // Path regex matching
         if let Some(regex_pattern) = &pred.path_regex {
             let path = self.extract_path(fact)?;
-            if let Ok(re) = regex::Regex::new(regex_pattern) {
+            if let Some(re) = cached_regex(regex_pattern) {
                 if !re.is_match(&path) {
                     return None;
                 }
@@ -501,13 +513,13 @@ impl SlotMatcher {
                 FactType::ShellCommand { command, .. } => command.clone(),
                 _ => return None,
             };
-            match regex::Regex::new(regex_pattern) {
-                Ok(re) => {
+            match cached_regex(regex_pattern) {
+                Some(re) => {
                     if !re.is_match(&cmdline) {
                         return None;
                     }
                 }
-                Err(_) => return None,
+                None => return None,
             }
         }
 
@@ -516,21 +528,21 @@ impl SlotMatcher {
         let actor_exe = fact.extra_fields.get("actor_exe").and_then(|v| v.as_str());
         if let Some(regex_pattern) = &pred.actor_exe_regex {
             let exe = actor_exe?;
-            match regex::Regex::new(regex_pattern) {
-                Ok(re) if re.is_match(exe) => {}
+            match cached_regex(regex_pattern) {
+                Some(re) if re.is_match(exe) => {}
                 _ => return None,
             }
         }
         if let Some(regex_pattern) = &pred.actor_exe_not_regex {
-            match regex::Regex::new(regex_pattern) {
-                Ok(re) => {
+            match cached_regex(regex_pattern) {
+                Some(re) => {
                     if let Some(exe) = actor_exe {
                         if re.is_match(exe) {
                             return None;
                         }
                     }
                 }
-                Err(_) => return None,
+                None => return None,
             }
         }
 
