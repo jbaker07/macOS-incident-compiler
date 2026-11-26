@@ -154,7 +154,7 @@ How facts are grouped: every fact is keyed to the audit session of the process b
 ## Limits
 
 - Live capture loses records under a burst. When the audit pipe's queue is full (1,024 records, the maximum the pipe reports), the kernel drops records: 10,709 in the passing CI run, about 7 percent. A dropped record is a missed event, so a detection can miss. The smoke test prints the count.
-- edr-locald is slow on a large capture: it took about 4 minutes to process the 32,098 events of that CI run.
+- edr-locald took about 4 minutes on the 32,098 events of that CI run (a debug build). It compiled each playbook regex again for every event and stored each detection in its own synced SQLite transaction. Both are fixed: patterns are compiled once and the database uses write-ahead logging. On a 30,800 event test segment it now takes 1.3 s in a release build (4.6 s before) and 9.6 s in a debug build (31 s before), with the same 1,760 detections.
 - BSM records the path a program passed. A relative path is joined to the process's working folder, which the reader learns from chdir, fchdir, fork and posix_spawn records. A process that changed folder before capture started keeps the relative path, marked `path_relative`.
 - The test trails are written with libbsm in the token order XNU uses. They were not recorded from a live kernel.
 - libbsm on macOS 27.2 writes the two bytes of an IPv6 port swapped (`au_to_sock_inet128` converts a port that is already in network order a second time), so `praudit` shows port 8443 as 64288. The parser swaps them back. XNU's token code also comes from OpenBSM, but this has not been checked on a live record.
