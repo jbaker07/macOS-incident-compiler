@@ -421,6 +421,11 @@ pub fn run_mock(fixture: &Path, root: &Path) -> Result<usize, String> {
     Ok(count)
 }
 
+/// Chunks the pipe reader may hold before it waits for the parser (each chunk is
+/// one read, at most 256 KiB).
+#[cfg(target_os = "macos")]
+const READ_CHUNKS_QUEUED: usize = 4096;
+
 #[cfg(target_os = "macos")]
 fn run_live(root: &Path, host: &str, classes: &str, once: bool, duration_secs: Option<u64>) -> Result<(), String> {
     if unsafe { libc::geteuid() } != 0 {
@@ -461,25 +466,63 @@ fn run_live(root: &Path, host: &str, classes: &str, once: bool, duration_secs: O
         transport: "auditpipe".to_string(),
         ..Default::default()
     };
-    let mut buffer = vec![0u8; pipe.max_record_bytes];
-    let mut file = &pipe.file;
+    // A reader thread only moves bytes from the pipe into a channel, and this loop
+    // parses, normalizes and writes them. The kernel's queue for one pipe holds at most
+    // queue_limit records (1,024 on GitHub's macOS runner). With all of the work in one
+    // loop the queue filled during bursts and the kernel dropped 10,709 of about 142,000
+    // records in one CI run. The reader now keeps draining while records are processed.
+    let pipe = Arc::new(pipe);
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(READ_CHUNKS_QUEUED);
+    let reader_pipe = pipe.clone();
+    let reader_stop = shutdown.clone();
+    let read_size = pipe.max_record_bytes.max(256 * 1024);
+    let reader = std::thread::Builder::new()
+        .name("auditpipe-reader".to_string())
+        .spawn(move || -> Result<(), String> {
+            let mut buffer = vec![0u8; read_size];
+            let mut file = &reader_pipe.file;
+            while !reader_stop.load(Ordering::SeqCst) {
+                if !reader_pipe.wait_readable(200).map_err(|e| format!("poll: {}", e))? {
+                    continue;
+                }
+                match file.read(&mut buffer) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        if chunk_tx.send(buffer[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(format!("read /dev/auditpipe: {}", e)),
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("could not start the pipe reader: {}", e))?;
+
     let mut segment_started = now_ms();
     let started = segment_started;
     let mut last_heartbeat = 0u64;
+    let mut feed = |chunk: &[u8], normalizer: &mut Normalizer, writer: &mut SegmentWriter, stats: &mut CaptureStats| {
+        splitter.feed(chunk);
+        while let Some(record) = splitter.next_record() {
+            process_record(&record, normalizer, writer, stats);
+        }
+        splitter.skipped_bytes
+    };
+    let mut skipped_bytes = 0u64;
 
     while !shutdown.load(Ordering::SeqCst) {
-        if pipe.wait_readable(1000).map_err(|e| format!("poll: {}", e))? {
-            match file.read(&mut buffer) {
-                Ok(0) => {}
-                Ok(n) => {
-                    splitter.feed(&buffer[..n]);
-                    while let Some(record) = splitter.next_record() {
-                        process_record(&record, &mut normalizer, &mut writer, &mut stats);
-                    }
+        match chunk_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(chunk) => {
+                skipped_bytes = feed(&chunk, &mut normalizer, &mut writer, &mut stats);
+                while let Ok(more) = chunk_rx.try_recv() {
+                    skipped_bytes = feed(&more, &mut normalizer, &mut writer, &mut stats);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(format!("read /dev/auditpipe: {}", e)),
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // The reader stopped on its own: its error is reported after the loop.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
         let now = now_ms();
@@ -505,11 +548,20 @@ fn run_live(root: &Path, host: &str, classes: &str, once: bool, duration_secs: O
         }
         if now.saturating_sub(last_heartbeat) >= HEARTBEAT_EVERY_MS {
             stats.pipe_drops = pipe.drops();
-            stats.skipped_bytes = splitter.skipped_bytes;
+            stats.skipped_bytes = skipped_bytes;
             write_heartbeat(root, &stats, &writer);
             last_heartbeat = now;
         }
     }
+
+    // Stop the reader, then process what it had already read.
+    shutdown.store(true, Ordering::SeqCst);
+    let reader_result = reader.join().unwrap_or_else(|_| Err("the pipe reader panicked".to_string()));
+    while let Ok(chunk) = chunk_rx.try_recv() {
+        skipped_bytes = feed(&chunk, &mut normalizer, &mut writer, &mut stats);
+    }
+    stats.skipped_bytes = skipped_bytes;
+    reader_result?;
 
     if let Some(meta) = writer.flush()? {
         eprintln!("[capture] wrote {} ({} events)", meta.rel_path, meta.records);
